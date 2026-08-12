@@ -1,0 +1,918 @@
+#!/usr/bin/env node
+'use strict';
+
+// claude-usage — one terminal view of Claude subscription usage limits across
+// multiple accounts (company orgs + personal).
+//
+//   claude-usage              show all accounts (first run: guided login)
+//   claude-usage login NAME   add / re-authenticate an account
+//   claude-usage remove NAME  forget an account
+//   claude-usage list         list stored accounts
+//   claude-usage sessions     show running Claude Code sessions + their accounts
+//   claude-usage serve [port] local web dashboard (default http://localhost:7788)
+//   claude-usage --json       machine-readable output
+//   claude-usage --demo       render fake data (no network)
+//
+// UNOFFICIAL: uses the same OAuth flow + usage endpoint as the Claude Code CLI
+// (api.anthropic.com/api/oauth/usage). Endpoints are undocumented and may change.
+// Tokens are stored in ~/.config/claude-usage/profiles.json (chmod 600).
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { spawn, execFile } = require('node:child_process');
+const readline = require('node:readline/promises');
+
+// ---- endpoint constants (Claude Code public OAuth client) -------------------
+const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+const AUTHORIZE_URL = 'https://claude.ai/oauth/authorize';
+// console.anthropic.com/v1/oauth/token 404s since the platform.claude.com migration
+// (api.anthropic.com and claude.ai also serve this path — fallbacks if this one moves)
+const TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
+const REDIRECT_URI = 'https://console.anthropic.com/oauth/code/callback';
+const SCOPES = 'org:create_api_key user:profile user:inference';
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+const BETA_HEADER = 'oauth-2025-04-20';
+const USER_AGENT = 'claude-code/2.0.14'; // mandatory shape — wrong/missing UA ⇒ permanent 429s
+// -----------------------------------------------------------------------------
+
+const CONFIG_DIR = path.join(os.homedir(), '.config', 'claude-usage');
+const PROFILES_PATH = path.join(CONFIG_DIR, 'profiles.json');
+const CACHE_PATH = path.join(CONFIG_DIR, 'cache.json');
+const FETCH_GAP_MS = 1000; // be gentle: the usage endpoint rate-limits hard
+const CACHE_TTL_MS = 120 * 1000; // ~180s is the community-reported safe poll interval
+const REFRESH_SLACK_MS = 2 * 60 * 1000;
+const ACTIVE_WINDOW_MS = 15 * 60 * 1000; // sessions touched within this get an "active" badge
+const DEFAULT_PORT = 7788;
+
+const isTTY = process.stdout.isTTY;
+const color = (code, s) => (isTTY ? `\x1b[${code}m${s}\x1b[0m` : s);
+const bold = (s) => color('1', s);
+const dim = (s) => color('2', s);
+const red = (s) => color('31', s);
+const green = (s) => color('32', s);
+const yellow = (s) => color('33', s);
+const cyan = (s) => color('36', s);
+
+const WINDOW_LABELS = {
+  five_hour: 'Session (5h)',
+  seven_day: 'Week (all models)',
+  seven_day_opus: 'Week (Opus)',
+  seven_day_sonnet: 'Week (Sonnet)',
+  seven_day_oauth_apps: 'Week (apps)',
+};
+const WINDOW_ORDER = Object.keys(WINDOW_LABELS);
+
+const tildify = (p) => (p && p.startsWith(os.homedir()) ? '~' + p.slice(os.homedir().length) : p);
+
+// ---- storage -----------------------------------------------------------------
+function loadStore() {
+  try {
+    return JSON.parse(fs.readFileSync(PROFILES_PATH, 'utf8'));
+  } catch {
+    return { profiles: {} };
+  }
+}
+
+function saveStore(store) {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(PROFILES_PATH, JSON.stringify(store, null, 2) + '\n');
+  fs.chmodSync(PROFILES_PATH, 0o600);
+}
+
+// ---- oauth login ---------------------------------------------------------------
+const b64url = (buf) =>
+  buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+async function login(label, rl) {
+  const verifier = b64url(crypto.randomBytes(32));
+  const challenge = b64url(crypto.createHash('sha256').update(verifier).digest());
+  const state = b64url(crypto.randomBytes(32));
+
+  const url = new URL(AUTHORIZE_URL);
+  url.searchParams.set('code', 'true');
+  url.searchParams.set('client_id', CLIENT_ID);
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('redirect_uri', REDIRECT_URI);
+  url.searchParams.set('scope', SCOPES);
+  url.searchParams.set('code_challenge', challenge);
+  url.searchParams.set('code_challenge_method', 'S256');
+  url.searchParams.set('state', state);
+
+  console.log('');
+  console.log(bold(`Logging in account "${label}"`));
+  console.log(
+    dim('Tip: the browser will use whichever claude.ai session is active. For a\n' +
+        'different account (or to pick the right org), open the URL in a private\n' +
+        'window or another browser profile instead.'));
+  console.log('\nOpening browser… if nothing opens, visit:\n' + cyan(url.toString()) + '\n');
+  if (process.platform === 'darwin') {
+    try { spawn('open', [url.toString()], { stdio: 'ignore', detached: true }).unref(); } catch {}
+  }
+
+  const raw = (await rl.question('Paste the authorization code shown after login: ')).trim();
+  if (!raw) throw new Error('no code entered');
+  const [code, returnedState] = raw.split('#');
+
+  const res = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT },
+    body: JSON.stringify({
+      grant_type: 'authorization_code',
+      code,
+      state: returnedState || state,
+      client_id: CLIENT_ID,
+      redirect_uri: REDIRECT_URI,
+      code_verifier: verifier,
+    }),
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!res.ok) {
+    throw new Error(`token exchange failed: HTTP ${res.status} ${await res.text().catch(() => '')}`);
+  }
+  const tok = await res.json();
+
+  const store = loadStore();
+  store.profiles[label] = {
+    access_token: tok.access_token,
+    refresh_token: tok.refresh_token,
+    expires_at: Date.now() + (tok.expires_in ? tok.expires_in * 1000 : 8 * 3600 * 1000),
+    account: tok.account || null,
+    organization: tok.organization || null,
+    added_at: new Date().toISOString(),
+  };
+  saveStore(store);
+
+  const who = describeIdentity(store.profiles[label]);
+  console.log(green(`✓ "${label}" logged in`) + (who ? ` — ${who}` : ''));
+  if (who) {
+    console.log(dim('  (check the org name above — if it grabbed the wrong org, re-run: ' +
+                    `claude-usage login ${label})`));
+  }
+}
+
+function describeIdentity(p) {
+  const email = p.account?.email_address || p.account?.email;
+  const org = p.organization?.name;
+  return [email, org].filter(Boolean).join(' · ');
+}
+
+async function refreshProfile(label, store) {
+  const p = store.profiles[label];
+  if (!p.refresh_token) throw new Error('no refresh token');
+  const res = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT },
+    body: JSON.stringify({
+      grant_type: 'refresh_token',
+      refresh_token: p.refresh_token,
+      client_id: CLIENT_ID,
+      redirect_uri: REDIRECT_URI,
+    }),
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!res.ok) throw new Error(`refresh failed: HTTP ${res.status}`);
+  const tok = await res.json();
+  p.access_token = tok.access_token;
+  if (tok.refresh_token) p.refresh_token = tok.refresh_token; // rotation-safe
+  p.expires_at = Date.now() + (tok.expires_in ? tok.expires_in * 1000 : 8 * 3600 * 1000);
+  saveStore(store);
+}
+
+// ---- usage fetch ---------------------------------------------------------------
+async function fetchUsage(label, store) {
+  const p = store.profiles[label];
+  if (Date.now() > (p.expires_at || 0) - REFRESH_SLACK_MS) {
+    await refreshProfile(label, store);
+  }
+  const doGet = () =>
+    fetch(USAGE_URL, {
+      headers: {
+        Authorization: `Bearer ${store.profiles[label].access_token}`,
+        'anthropic-beta': BETA_HEADER,
+        'User-Agent': USER_AGENT,
+        Accept: 'application/json',
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+
+  let res = await doGet();
+  if (res.status === 401) {
+    await refreshProfile(label, store);
+    res = await doGet();
+  }
+  if (res.status === 429) return { __error: 'rate-limited by the usage endpoint — try again in a few minutes' };
+  if (!res.ok) return { __error: `HTTP ${res.status}` };
+  return res.json();
+}
+
+// transient network/server errors are worth retrying; 401 (handled inline) and
+// 429 (rate limit — retrying makes it worse) are not
+const TRANSIENT_RE = /fetch failed|network|timed? ?out|socket|ECONN|EAI_AGAIN|ENOTFOUND|HTTP 5\d\d/i;
+
+async function fetchUsageWithRetry(label, store, attempts = 3) {
+  let last = { __error: 'failed' };
+  for (let i = 0; i < attempts; i++) {
+    if (i) await new Promise((r) => setTimeout(r, 1500 * i));
+    try {
+      const data = await fetchUsage(label, store);
+      if (!(data.__error && TRANSIENT_RE.test(data.__error))) return data;
+      last = data;
+    } catch (e) {
+      if (!TRANSIENT_RE.test(e.message)) return { __error: e.message };
+      last = { __error: e.message };
+    }
+  }
+  return last;
+}
+
+// Shared by the CLI table and the web dashboard. Serves from the on-disk cache
+// inside CACHE_TTL_MS so browser refreshes can't hammer the rate-limited endpoint.
+async function gatherUsage({ fresh = false } = {}) {
+  const store = loadStore();
+  const labels = Object.keys(store.profiles);
+  let cache = {};
+  try { cache = JSON.parse(fs.readFileSync(CACHE_PATH, 'utf8')); } catch {}
+
+  const accounts = [];
+  let fetchedAny = false;
+  for (const label of labels) {
+    const c = cache[label];
+    let data, cachedMs = 0, stale = null;
+    if (!fresh && c && Date.now() - c.at < CACHE_TTL_MS) {
+      data = c.data;
+      cachedMs = Date.now() - c.at;
+    } else {
+      if (fetchedAny) await new Promise((r) => setTimeout(r, FETCH_GAP_MS));
+      fetchedAny = true;
+      data = await fetchUsageWithRetry(label, store);
+      if (!data.__error) {
+        cache[label] = { at: Date.now(), data };
+      } else if (c) {
+        // stale-if-error: last good snapshot beats a bare error
+        stale = data.__error;
+        data = c.data;
+        cachedMs = Date.now() - c.at;
+      }
+    }
+    accounts.push({ label, identity: describeIdentity(store.profiles[label]), cachedMs, stale, data });
+  }
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(CACHE_PATH, JSON.stringify(cache));
+    fs.chmodSync(CACHE_PATH, 0o600);
+  } catch {}
+  return { accounts };
+}
+
+// ---- running Claude Code sessions (macOS) ---------------------------------------
+const pexec = (cmd, args, timeout = 8000) =>
+  new Promise((resolve) => {
+    execFile(cmd, args, { timeout, maxBuffer: 8 * 1024 * 1024 }, (err, stdout) =>
+      resolve(err ? '' : String(stdout)));
+  });
+
+function looksLikeClaude(args) {
+  const tokens = args.trim().split(/\s+/);
+  if (!tokens.length) return false;
+  const base = (t) => (t || '').split('/').pop();
+  let head = base(tokens[0]);
+  if (head === 'node' && tokens[1]) head = base(tokens[1]);
+  return head === 'claude';
+}
+
+function readConfigIdentity(configDir) {
+  // default config dir keeps its config at ~/.claude.json (home root);
+  // CLAUDE_CONFIG_DIR installs keep it at <dir>/.claude.json
+  const candidates = [path.join(configDir, '.claude.json')];
+  if (configDir === path.join(os.homedir(), '.claude')) {
+    candidates.unshift(path.join(os.homedir(), '.claude.json'));
+  }
+  for (const file of candidates) {
+    try {
+      const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const a = j.oauthAccount || {};
+      const email = a.emailAddress || a.email_address || null;
+      const org = a.organizationName || a.organization_name || null;
+      if (email || org) return { email, org };
+    } catch {}
+  }
+  return null;
+}
+
+// Claude Code appends each session's transcript to
+// <configDir>/projects/<cwd with non-alphanumerics as '-'>/*.jsonl, so the
+// newest transcript mtime for a session's cwd is its last activity. Sessions
+// sharing a cwd share that directory — close enough for a freshness badge.
+function lastActivityAt(configDir, cwd) {
+  if (!cwd) return null;
+  const dir = path.join(configDir, 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'));
+  let entries;
+  try { entries = fs.readdirSync(dir); } catch { return null; }
+  let latest = 0;
+  for (const f of entries) {
+    if (!f.endsWith('.jsonl')) continue;
+    try { latest = Math.max(latest, fs.statSync(path.join(dir, f)).mtimeMs); } catch {}
+  }
+  return latest ? new Date(latest).toISOString() : null;
+}
+
+async function collectSessions() {
+  const psOut = await pexec('ps', ['-axo', 'pid=,ppid=,lstart=,args=']);
+  const candidates = [];
+  for (const line of psOut.split('\n')) {
+    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+[\d:]+\s+\d{4})\s+(.+)$/);
+    if (!m) continue;
+    const [, pid, ppid, lstart, args] = m;
+    if (!looksLikeClaude(args)) continue;
+    candidates.push({ pid: Number(pid), ppid: Number(ppid), lstart, args });
+  }
+  // a claude whose parent is also a claude is a spawned helper, not a session
+  const pids = new Set(candidates.map((c) => c.pid));
+  const sessions = candidates.filter((c) => !pids.has(c.ppid));
+
+  // cwd for all pids in one lsof call
+  const cwds = {};
+  if (sessions.length) {
+    const out = await pexec('lsof', ['-a', '-p', sessions.map((s) => s.pid).join(','), '-d', 'cwd', '-Fpn']);
+    let cur = null;
+    for (const line of out.split('\n')) {
+      if (line.startsWith('p')) cur = Number(line.slice(1));
+      else if (line.startsWith('n') && cur) cwds[cur] = line.slice(1);
+    }
+  }
+
+  const results = [];
+  for (const s of sessions) {
+    // env of own processes via ps -E; CLAUDE_CONFIG_DIR defaults to ~/.claude
+    const envOut = await pexec('ps', ['-Eww', '-o', 'args=', '-p', String(s.pid)]);
+    const envMatch = envOut.match(/CLAUDE_CONFIG_DIR=(\S+)/);
+    const configDir = envMatch ? envMatch[1] : path.join(os.homedir(), '.claude');
+    const startedAt = new Date(s.lstart);
+    const started = isNaN(startedAt) ? null : startedAt.toISOString();
+    const cwd = cwds[s.pid] || null;
+    results.push({
+      pid: s.pid,
+      startedAt: started,
+      lastActiveAt: lastActivityAt(configDir, cwd) || started,
+      configDir: tildify(configDir),
+      account: readConfigIdentity(configDir),
+      cwd: tildify(cwd),
+    });
+  }
+  // most recently active first; sessions with no known activity sink to the bottom
+  results.sort((a, b) => new Date(b.lastActiveAt || 0) - new Date(a.lastActiveAt || 0));
+  return { sessions: results, generatedAt: new Date().toISOString(), platform: process.platform };
+}
+
+// ---- rendering (terminal) --------------------------------------------------------
+function fmtRel(ms) {
+  const mins = Math.round(ms / 60e3);
+  const hrs = Math.round(ms / 3600e3);
+  if (ms <= 0) return 'now';
+  if (mins < 60) return `${mins}m`;
+  if (hrs < 48) return `${Math.floor(mins / 60)}h ${mins % 60}m`;
+  return `${Math.floor(hrs / 24)}d ${hrs % 24}h`;
+}
+
+function fmtResets(iso) {
+  if (!iso) return '';
+  const t = new Date(iso);
+  if (isNaN(t)) return String(iso);
+  const abs = t.toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+  return `resets in ${fmtRel(t - Date.now())} ${dim(`(${abs})`)}`;
+}
+
+function bar(pct) {
+  const width = 20;
+  const filled = Math.max(0, Math.min(width, Math.round((pct / 100) * width)));
+  const paint = pct >= 85 ? red : pct >= 60 ? yellow : green;
+  return paint('█'.repeat(filled)) + dim('░'.repeat(width - filled));
+}
+
+function windowsOf(data) {
+  // windows can be null (e.g. seven_day_opus on non-Max plans); extra_usage is
+  // money-denominated and rendered separately — only render blocks with a
+  // numeric utilization
+  const entries = Object.entries(data).filter(
+    ([k, v]) => k !== 'extra_usage' && v && typeof v === 'object' && typeof v.utilization === 'number',
+  );
+  entries.sort(([a], [b]) => {
+    const ia = WINDOW_ORDER.indexOf(a); const ib = WINDOW_ORDER.indexOf(b);
+    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+  });
+  return entries;
+}
+
+const fmtAge = (ms) => (ms < 120e3 ? Math.round(ms / 1000) + 's' : fmtRel(ms));
+
+function renderAccount({ label, identity, data, cachedMs, stale }) {
+  const age = cachedMs ? dim(`  [cached ${fmtAge(cachedMs)} ago]`) : '';
+  console.log(bold(label) + (identity ? dim(`  (${identity})`) : '') + age);
+  if (stale) {
+    console.log('  ' + yellow(`⚠ refresh failed (${stale}) — showing last known data`));
+  }
+  if (data.__error) {
+    console.log('  ' + yellow(`⚠ ${data.__error}`));
+    if (/401|refresh/.test(data.__error)) {
+      console.log('  ' + dim(`re-authenticate with: claude-usage login ${label}`));
+    }
+    console.log('');
+    return;
+  }
+  const wins = windowsOf(data);
+  if (!wins.length) {
+    console.log('  ' + dim('no usage windows in response'));
+  }
+  for (const [key, w] of wins) {
+    const name = (WINDOW_LABELS[key] || key.replace(/_/g, ' ')).padEnd(19);
+    const pct = w.utilization;
+    const pctStr = String(Math.round(pct)).padStart(3) + '%';
+    console.log(`  ${name} ${bar(pct)} ${pctStr}   ${fmtResets(w.resets_at)}`);
+  }
+  const xu = data.extra_usage;
+  if (xu && typeof xu === 'object') {
+    const name = 'Extra usage (mo)'.padEnd(19);
+    if (xu.is_enabled) {
+      const pct = xu.utilization ?? 0;
+      const pctStr = String(Math.round(pct)).padStart(3) + '%';
+      const spent = xu.used_credits != null && xu.monthly_limit != null
+        ? dim(`${fmtMoney(xu.used_credits, xu)} of ${fmtMoney(xu.monthly_limit, xu)}`)
+        : '';
+      console.log(`  ${name} ${bar(pct)} ${pctStr}   ${spent}`);
+    } else {
+      const why = xu.disabled_reason || (xu.user_disabled ? 'user_disabled' : '');
+      console.log(`  ${name} ${dim('off' + (why ? ` (${why})` : ''))}`);
+    }
+  }
+  console.log('');
+}
+
+function fmtMoney(credits, xu) {
+  const dp = typeof xu.decimal_places === 'number' ? xu.decimal_places : 2;
+  return (credits / 10 ** dp).toFixed(dp) + (xu.currency ? ' ' + xu.currency : '');
+}
+
+// ---- commands ------------------------------------------------------------------
+async function cmdShow({ json = false, fresh = false } = {}) {
+  const store = loadStore();
+  if (!Object.keys(store.profiles).length) return onboard();
+
+  const result = await gatherUsage({ fresh });
+  if (json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  console.log('');
+  for (const acct of result.accounts) renderAccount(acct);
+}
+
+async function onboard() {
+  console.log(bold('\nclaude-usage — first run\n'));
+  console.log('No accounts stored yet. Let’s add them one by one; each gets a short label');
+  console.log('(e.g. company-org1, company-org2, personal-1, personal-2).\n');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    for (;;) {
+      const label = (await rl.question('Label for this account (empty to finish): ')).trim();
+      if (!label) break;
+      if (!/^[a-zA-Z0-9._-]+$/.test(label)) { console.log(red('letters/digits/._- only')); continue; }
+      try {
+        await login(label, rl);
+      } catch (e) {
+        console.log(red(`login failed: ${e.message}`));
+      }
+    }
+  } finally {
+    rl.close();
+  }
+  const store = loadStore();
+  if (Object.keys(store.profiles).length) await cmdShow();
+}
+
+async function cmdLogin(label) {
+  if (!label) { console.error('usage: claude-usage login <label>'); process.exit(1); }
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try { await login(label, rl); } finally { rl.close(); }
+}
+
+function cmdRemove(label) {
+  const store = loadStore();
+  if (!store.profiles[label]) { console.error(`no such account: ${label}`); process.exit(1); }
+  delete store.profiles[label];
+  saveStore(store);
+  console.log(`removed "${label}"`);
+}
+
+function cmdList() {
+  const store = loadStore();
+  const labels = Object.keys(store.profiles);
+  if (!labels.length) return console.log('no accounts stored — run: claude-usage');
+  for (const label of labels) {
+    const p = store.profiles[label];
+    const who = describeIdentity(p);
+    const fresh = Date.now() < (p.expires_at || 0) ? green('token ok') : yellow('token stale (auto-refreshes)');
+    console.log(`${bold(label.padEnd(16))} ${who ? who + '  ' : ''}${dim(fresh)}`);
+  }
+}
+
+async function cmdSessions() {
+  if (process.platform !== 'darwin') {
+    console.log(yellow('session detection is implemented for macOS only'));
+  }
+  const { sessions } = await collectSessions();
+  if (!sessions.length) return console.log('no running Claude Code sessions found');
+  // pad plain strings first — ANSI codes inside padEnd break column widths
+  const trunc = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + '…' : s || '');
+  console.log('');
+  console.log(dim('PID'.padEnd(8) + 'CONFIG'.padEnd(18) + 'ACCOUNT'.padEnd(34) + 'PROJECT'.padEnd(34) + 'LAST ACTIVE'.padEnd(16) + 'UP'));
+  for (const s of sessions) {
+    const who = s.account ? [s.account.email, s.account.org].filter(Boolean).join(' · ') : 'unknown';
+    const up = s.startedAt ? fmtRel(Date.now() - new Date(s.startedAt)) : '';
+    const idleMs = s.lastActiveAt ? Math.max(0, Date.now() - new Date(s.lastActiveAt)) : null;
+    const active = idleMs !== null && idleMs < ACTIVE_WINDOW_MS;
+    const last = idleMs === null ? '-' : (active ? '● ' : '') + fmtAge(idleMs) + ' ago';
+    console.log(
+      String(s.pid).padEnd(8) +
+      trunc(s.configDir, 16).padEnd(18) +
+      (s.account ? trunc(who, 32).padEnd(34) : dim('unknown'.padEnd(34))) +
+      trunc(s.cwd || '-', 32).padEnd(34) +
+      (active ? green(last.padEnd(16)) : dim(last.padEnd(16))) +
+      dim(up),
+    );
+  }
+  console.log('');
+}
+
+function cmdServe(portArg) {
+  const port = Number(portArg) || DEFAULT_PORT;
+  const http = require('node:http');
+  const sendJson = (res, code, obj) => {
+    res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(obj));
+  };
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    try {
+      if (url.pathname === '/') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(PAGE_HTML);
+      } else if (url.pathname === '/api/usage') {
+        if (url.searchParams.get('demo') === '1') {
+          sendJson(res, 200, { accounts: demoAccounts() });
+        } else {
+          sendJson(res, 200, await gatherUsage({ fresh: url.searchParams.get('fresh') === '1' }));
+        }
+      } else if (url.pathname === '/api/sessions') {
+        sendJson(res, 200, await collectSessions());
+      } else {
+        sendJson(res, 404, { error: 'not found' });
+      }
+    } catch (e) {
+      sendJson(res, 500, { error: e.message });
+    }
+  });
+  server.on('error', (e) => {
+    if (e.code === 'EADDRINUSE') {
+      console.error(red(`port ${port} is in use — try: claude-usage serve ${port + 1}`));
+      process.exit(1);
+    }
+    throw e;
+  });
+  // localhost only: the dashboard exposes account identities, never bind wider
+  server.listen(port, '127.0.0.1', () => {
+    console.log(`claude-usage dashboard: ${cyan(`http://localhost:${port}`)}  (Ctrl-C to stop)`);
+  });
+}
+
+function demoAccounts() {
+  const now = Date.now();
+  const iso = (h) => new Date(now + h * 3600e3).toISOString();
+  return [
+    { label: 'company-org1', identity: 'you@company.com · Org One', cachedMs: 0, data: { five_hour: { utilization: 8, resets_at: iso(2.3) }, seven_day: { utilization: 34, resets_at: iso(100) }, seven_day_opus: { utilization: 81, resets_at: iso(100) }, extra_usage: { is_enabled: true, monthly_limit: 35000, used_credits: 17586, utilization: 50.2, currency: 'USD', decimal_places: 2 } } },
+    { label: 'company-org2', identity: 'you@company.com · Org Two', cachedMs: 0, data: { five_hour: { utilization: 0, resets_at: null }, seven_day: { utilization: 3, resets_at: iso(52) } } },
+    { label: 'personal-1', identity: '', cachedMs: 45000, data: { five_hour: { utilization: 62, resets_at: iso(0.5) }, seven_day: { utilization: 91, resets_at: iso(12) } } },
+    { label: 'personal-2', identity: '', cachedMs: 0, data: { __error: 'rate-limited by the usage endpoint — try again in a few minutes' } },
+  ];
+}
+
+function cmdDemo() {
+  console.log('');
+  for (const acct of demoAccounts()) renderAccount(acct);
+}
+
+function help() {
+  console.log(`claude-usage — usage limits for all your Claude accounts in one view
+
+  claude-usage              show all accounts (first run: guided login)
+  claude-usage login NAME   add / re-authenticate an account
+  claude-usage remove NAME  forget an account
+  claude-usage list         list stored accounts
+  claude-usage sessions     running Claude Code sessions + the account each uses
+  claude-usage serve [port] web dashboard on http://localhost:${DEFAULT_PORT} (localhost only)
+  claude-usage --json       raw JSON output
+  claude-usage --fresh      bypass the 2-minute result cache
+  claude-usage --demo       render sample output (no network)
+
+Tokens live in ~/.config/claude-usage/profiles.json (chmod 600).
+Unofficial endpoints — may break without notice. Results are cached for 2
+minutes because the usage endpoint rate-limits aggressively (~3 min safe
+polling interval).`);
+}
+
+// ---- web dashboard page -----------------------------------------------------------
+// Design tokens follow the dataviz reference palette: status colors are fixed and
+// always paired with the numeric value (never color alone); dark mode is selected
+// steps, not an automatic flip; tabular-nums where columns must align.
+const PAGE_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>claude-usage</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7; --surface: #fcfcfb;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --hairline: #e1e0d9; --border: rgba(11,11,11,.10);
+    --good: #0ca30c; --warning: #fab219; --critical: #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --page: #0d0d0d; --surface: #1a1a19;
+      --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+      --hairline: #2c2c2a; --border: rgba(255,255,255,.10);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 24px; max-width: 860px; margin-inline: auto;
+  }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 20px; }
+  h1 { font-size: 17px; margin: 0; }
+  h2 { font-size: 13px; margin: 28px 0 8px; color: var(--ink-2); font-weight: 600;
+       text-transform: uppercase; letter-spacing: .04em; }
+  #updated { color: var(--muted); font-size: 12px; }
+  #refresh {
+    margin-left: auto; font: inherit; font-size: 12px; padding: 4px 10px;
+    border: 1px solid var(--border); border-radius: 6px; background: var(--surface);
+    color: var(--ink-2); cursor: pointer;
+  }
+  #refresh:disabled { opacity: .5; cursor: default; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 12px;
+  }
+  .card-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+  .card-head .label { font-weight: 600; }
+  .card-head .who, .card-head .age { color: var(--muted); font-size: 12px; }
+  .card-head .age { margin-left: auto; }
+  .meter { display: grid; grid-template-columns: 150px 1fr 46px minmax(150px, auto);
+           align-items: center; gap: 10px; padding: 4px 0; }
+  .meter .win { color: var(--ink-2); font-size: 13px; }
+  .meter .track { height: 8px; border-radius: 4px; background: var(--hairline); overflow: hidden; }
+  .meter .fill { height: 100%; border-radius: 4px; min-width: 2px; }
+  .meter .pct { font-variant-numeric: tabular-nums; text-align: right; font-weight: 600; }
+  .meter .resets { color: var(--muted); font-size: 12px; }
+  .warnline { color: var(--ink-2); font-size: 13px; }
+  .warnline .icon { color: var(--warning); }
+  table { width: 100%; border-collapse: collapse; background: var(--surface);
+          border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 8px 12px; font-size: 13px; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; border-bottom: 1px solid var(--hairline); }
+  td { border-bottom: 1px solid var(--hairline); }
+  tr:last-child td { border-bottom: none; }
+  td.num { font-variant-numeric: tabular-nums; }
+  td .cfg { color: var(--ink-2); }
+  .badge { display: inline-flex; align-items: center; gap: 5px; color: var(--good);
+           font-size: 12px; font-weight: 600; }
+  .badge::before { content: ''; width: 7px; height: 7px; border-radius: 50%;
+                   background: var(--good); flex: none; }
+  td .idle { color: var(--muted); }
+  .empty { color: var(--muted); padding: 14px 2px; font-size: 13px; }
+  @media (max-width: 640px) {
+    .meter { grid-template-columns: 110px 1fr 42px; }
+    .meter .resets { grid-column: 2 / -1; padding-bottom: 4px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>claude-usage</h1>
+  <span id="updated"></span>
+  <button id="refresh">Refresh now</button>
+</header>
+<div id="accounts"><div class="empty">Loading…</div></div>
+<h2>Active Claude Code sessions</h2>
+<div id="sessions"><div class="empty">Loading…</div></div>
+<script>
+const WINDOW_LABELS = ${JSON.stringify(WINDOW_LABELS)};
+const WINDOW_ORDER = ${JSON.stringify(WINDOW_ORDER)};
+
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+};
+const statusVar = (p) => p >= 85 ? 'var(--critical)' : p >= 60 ? 'var(--warning)' : 'var(--good)';
+
+function fmtRel(ms) {
+  const mins = Math.round(ms / 60e3), hrs = Math.round(ms / 3600e3);
+  if (ms <= 0) return 'now';
+  if (mins < 60) return mins + 'm';
+  if (hrs < 48) return Math.floor(mins / 60) + 'h ' + (mins % 60) + 'm';
+  return Math.floor(hrs / 24) + 'd ' + (hrs % 24) + 'h';
+}
+function fmtResets(iso) {
+  if (!iso) return '';
+  const t = new Date(iso);
+  if (isNaN(t)) return String(iso);
+  const abs = t.toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+  return 'resets in ' + fmtRel(t - Date.now()) + ' (' + abs + ')';
+}
+const fmtAge = (ms) => (ms < 120e3 ? Math.round(ms / 1000) + 's' : fmtRel(ms));
+
+function renderAccounts(result) {
+  const root = document.getElementById('accounts');
+  root.replaceChildren();
+  if (!result.accounts || !result.accounts.length) {
+    root.append(el('div', 'empty',
+      'No accounts stored — run claude-usage in a terminal to log in.'));
+    return;
+  }
+  for (const acct of result.accounts) {
+    const card = el('div', 'card');
+    const head = el('div', 'card-head');
+    head.append(el('span', 'label', acct.label));
+    if (acct.identity) head.append(el('span', 'who', acct.identity));
+    if (acct.cachedMs) {
+      const age = acct.cachedMs < 120e3 ? Math.round(acct.cachedMs / 1000) + 's' : fmtRel(acct.cachedMs);
+      head.append(el('span', 'age', 'cached ' + age + ' ago'));
+    }
+    card.append(head);
+    if (acct.stale) {
+      const w = el('div', 'warnline');
+      w.append(el('span', 'icon', '⚠ '),
+        document.createTextNode('refresh failed (' + acct.stale + ') — showing last known data'));
+      card.append(w);
+    }
+    if (acct.data.__error) {
+      const w = el('div', 'warnline');
+      w.append(el('span', 'icon', '⚠ '), document.createTextNode(acct.data.__error));
+      card.append(w);
+    } else {
+      const wins = Object.entries(acct.data)
+        .filter(([k, v]) => k !== 'extra_usage' && v && typeof v === 'object' && typeof v.utilization === 'number')
+        .sort(([a], [b]) => {
+          const ia = WINDOW_ORDER.indexOf(a), ib = WINDOW_ORDER.indexOf(b);
+          return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+        });
+      if (!wins.length) card.append(el('div', 'empty', 'no usage windows in response'));
+      for (const [key, w] of wins) {
+        const row = el('div', 'meter');
+        row.append(el('span', 'win', WINDOW_LABELS[key] || key.replace(/_/g, ' ')));
+        const track = el('div', 'track');
+        const fill = el('div', 'fill');
+        const pct = Math.max(0, Math.min(100, w.utilization));
+        fill.style.width = pct + '%';
+        fill.style.background = statusVar(pct);
+        track.append(fill);
+        row.append(track);
+        row.append(el('span', 'pct', Math.round(pct) + '%'));
+        row.append(el('span', 'resets', fmtResets(w.resets_at)));
+        card.append(row);
+      }
+      const xu = acct.data.extra_usage;
+      if (xu && typeof xu === 'object') {
+        if (xu.is_enabled) {
+          const dp = typeof xu.decimal_places === 'number' ? xu.decimal_places : 2;
+          const money = (c) => (c / Math.pow(10, dp)).toFixed(dp) + (xu.currency ? ' ' + xu.currency : '');
+          const row = el('div', 'meter');
+          row.append(el('span', 'win', 'Extra usage (month)'));
+          const track = el('div', 'track');
+          const fill = el('div', 'fill');
+          const pct = Math.max(0, Math.min(100, xu.utilization || 0));
+          fill.style.width = pct + '%';
+          fill.style.background = statusVar(pct);
+          track.append(fill);
+          row.append(track);
+          row.append(el('span', 'pct', Math.round(pct) + '%'));
+          row.append(el('span', 'resets',
+            xu.used_credits != null && xu.monthly_limit != null
+              ? money(xu.used_credits) + ' of ' + money(xu.monthly_limit) : ''));
+          card.append(row);
+        } else {
+          const why = xu.disabled_reason || (xu.user_disabled ? 'user_disabled' : '');
+          card.append(el('div', 'warnline', 'Extra usage: off' + (why ? ' (' + why + ')' : '')));
+        }
+      }
+    }
+    root.append(card);
+  }
+  document.getElementById('updated').textContent =
+    'updated ' + new Date().toLocaleTimeString();
+}
+
+function renderSessions(result) {
+  const root = document.getElementById('sessions');
+  root.replaceChildren();
+  if (!result.sessions || !result.sessions.length) {
+    root.append(el('div', 'empty', 'No running Claude Code sessions found.'));
+    return;
+  }
+  const table = el('table');
+  const thead = el('thead'); const hr = el('tr');
+  for (const h of ['PID', 'Config', 'Account', 'Project', 'Last active', 'Up']) hr.append(el('th', null, h));
+  thead.append(hr); table.append(thead);
+  const tbody = el('tbody');
+  for (const s of result.sessions) {
+    const tr = el('tr');
+    tr.append(el('td', 'num', String(s.pid)));
+    const cfg = el('td'); cfg.append(el('span', 'cfg', s.configDir || '')); tr.append(cfg);
+    tr.append(el('td', null, s.account
+      ? [s.account.email, s.account.org].filter(Boolean).join(' · ') : 'unknown'));
+    tr.append(el('td', null, s.cwd || '–'));
+    const last = el('td', 'num');
+    const idleMs = s.lastActiveAt ? Math.max(0, Date.now() - new Date(s.lastActiveAt)) : null;
+    if (idleMs === null) {
+      last.append(el('span', 'idle', '–'));
+    } else if (idleMs < ${ACTIVE_WINDOW_MS}) {
+      last.append(el('span', 'badge', 'active'));
+      last.append(el('span', 'idle', ' · ' + fmtAge(idleMs) + ' ago'));
+    } else {
+      last.append(el('span', 'idle', fmtAge(idleMs) + ' ago'));
+    }
+    tr.append(last);
+    tr.append(el('td', 'num', s.startedAt ? fmtRel(Date.now() - new Date(s.startedAt)) : ''));
+    tbody.append(tr);
+  }
+  table.append(tbody);
+  root.append(table);
+}
+
+const DEMO = new URLSearchParams(location.search).has('demo');
+async function loadUsage(fresh) {
+  try {
+    const r = await fetch('/api/usage' + (DEMO ? '?demo=1' : fresh ? '?fresh=1' : ''));
+    renderAccounts(await r.json());
+  } catch (e) {
+    document.getElementById('accounts').replaceChildren(
+      el('div', 'empty', 'failed to load usage: ' + e.message));
+  }
+}
+async function loadSessions() {
+  try {
+    const r = await fetch('/api/sessions');
+    renderSessions(await r.json());
+  } catch (e) {
+    document.getElementById('sessions').replaceChildren(
+      el('div', 'empty', 'failed to load sessions: ' + e.message));
+  }
+}
+
+document.getElementById('refresh').addEventListener('click', async (ev) => {
+  const b = ev.currentTarget;
+  b.disabled = true;
+  await Promise.all([loadUsage(true), loadSessions()]);
+  setTimeout(() => { b.disabled = false; }, 15000); // respect the endpoint's rate limit
+});
+
+loadUsage(false);
+loadSessions();
+setInterval(() => loadUsage(false), 180000); // ~3 min: the safe polling interval
+setInterval(loadSessions, 15000);
+</script>
+</body>
+</html>`;
+
+// ---- main ---------------------------------------------------------------------
+(async () => {
+  const argv = process.argv.slice(2);
+  const flags = new Set(argv.filter((a) => a.startsWith('-')));
+  const [cmd, arg] = argv.filter((a) => !a.startsWith('-'));
+  if (flags.has('--help') || flags.has('-h')) return help();
+  if (flags.has('--demo')) return cmdDemo();
+  switch (cmd) {
+    case undefined:
+      return cmdShow({ json: flags.has('--json'), fresh: flags.has('--fresh') });
+    case 'login': return cmdLogin(arg);
+    case 'remove': return cmdRemove(arg);
+    case 'list': return cmdList();
+    case 'sessions': return cmdSessions();
+    case 'serve': return cmdServe(arg);
+    case 'help': return help();
+    default:
+      console.error(`unknown command: ${cmd}\n`);
+      help();
+      process.exit(1);
+  }
+})().catch((e) => {
+  console.error(red(`error: ${e.message}`));
+  process.exit(1);
+});
