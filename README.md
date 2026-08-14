@@ -3,7 +3,7 @@
 One terminal view of your Claude subscription usage limits across **multiple accounts** — work orgs and personal plans side by side. Comes with a local web dashboard and a live list of your running Claude Code sessions.
 
 ```
-company-org1  (you@company.com · Org One)
+company-org1  (you@company.com · Org One)  ● active (2m ago)
   Session (5h)        ██░░░░░░░░░░░░░░░░░░   8%   resets in 2h 18m (Wed 09:08 PM)
   Week (all models)   ███████░░░░░░░░░░░░░  34%   resets in 4d 4h (Sun 10:50 PM)
   Week (Opus)         ████████████████░░░░  81%   resets in 4d 4h (Sun 10:50 PM)
@@ -13,7 +13,7 @@ company-org2  (you@company.com · Org Two)
   Session (5h)        ░░░░░░░░░░░░░░░░░░░░   0%
   Week (all models)   █░░░░░░░░░░░░░░░░░░░   3%   resets in 2d 4h (Fri 10:50 PM)
 
-personal-1  [cached 45s ago]
+personal-1  [cached 45s ago]  last session 26h ago
   Session (5h)        ████████████░░░░░░░░  62%   resets in 30m (Wed 07:20 PM)
   Week (all models)   ██████████████████░░  91%   resets in 12h 0m (Thu 06:50 AM)
 ```
@@ -28,6 +28,7 @@ If you juggle several Claude subscriptions (a couple of company orgs, a personal
 - **All usage windows** — 5-hour session, weekly (all models / Opus / Sonnet / apps), and monthly extra-usage spend, with reset times.
 - **Web dashboard** — `claude-usage serve` gives you a self-refreshing localhost page with the same data.
 - **Running sessions** (macOS) — `claude-usage sessions` lists every running Claude Code process, which account and config dir it uses, its project directory, and when it was last active — sorted most-recent first, with an **● active** badge for sessions that did something in the last 15 minutes.
+- **Per-account activity** (macOS) — each account's usage card shows when a running session last used that account (matched by email + org), with an **● active** badge if it was within the last 15 minutes — so you can see at a glance which subscription is burning right now.
 - **Polite to the API** — results are cached for 2 minutes and fetches are spaced out, because the usage endpoint rate-limits aggressively.
 - **Zero dependencies** — a single executable Node script.
 

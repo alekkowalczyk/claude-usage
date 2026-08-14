@@ -256,7 +256,14 @@ async function gatherUsage({ fresh = false } = {}) {
         cachedMs = Date.now() - c.at;
       }
     }
-    accounts.push({ label, identity: describeIdentity(store.profiles[label]), cachedMs, stale, data });
+    const p = store.profiles[label];
+    accounts.push({
+      label,
+      identity: describeIdentity(p),
+      email: p.account?.email_address || p.account?.email || null,
+      org: p.organization?.name || null,
+      cachedMs, stale, data,
+    });
   }
   try {
     fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
@@ -366,6 +373,26 @@ async function collectSessions() {
   return { sessions: results, generatedAt: new Date().toISOString(), platform: process.platform };
 }
 
+// Join usage accounts to running sessions by (email, org) so each account
+// shows when one of its sessions last did anything. Org must match only when
+// both sides know it — the same email can belong to several orgs.
+async function attachSessionActivity(accounts) {
+  let sessions = [];
+  try { ({ sessions } = await collectSessions()); } catch { return; }
+  for (const acct of accounts) {
+    const email = (acct.email || '').toLowerCase();
+    if (!email) continue;
+    let latest = null;
+    for (const s of sessions) {
+      if (!s.account || !s.lastActiveAt) continue;
+      if ((s.account.email || '').toLowerCase() !== email) continue;
+      if (acct.org && s.account.org && s.account.org !== acct.org) continue;
+      if (!latest || s.lastActiveAt > latest) latest = s.lastActiveAt;
+    }
+    acct.lastSessionAt = latest;
+  }
+}
+
 // ---- rendering (terminal) --------------------------------------------------------
 function fmtRel(ms) {
   const mins = Math.round(ms / 60e3);
@@ -407,9 +434,16 @@ function windowsOf(data) {
 
 const fmtAge = (ms) => (ms < 120e3 ? Math.round(ms / 1000) + 's' : fmtRel(ms));
 
-function renderAccount({ label, identity, data, cachedMs, stale }) {
+function renderAccount({ label, identity, data, cachedMs, stale, lastSessionAt }) {
   const age = cachedMs ? dim(`  [cached ${fmtAge(cachedMs)} ago]`) : '';
-  console.log(bold(label) + (identity ? dim(`  (${identity})`) : '') + age);
+  let act = '';
+  if (lastSessionAt) {
+    const ms = Math.max(0, Date.now() - new Date(lastSessionAt));
+    act = ms < ACTIVE_WINDOW_MS
+      ? '  ' + green(`● active (${fmtAge(ms)} ago)`)
+      : '  ' + dim(`last session ${fmtAge(ms)} ago`);
+  }
+  console.log(bold(label) + (identity ? dim(`  (${identity})`) : '') + age + act);
   if (stale) {
     console.log('  ' + yellow(`⚠ refresh failed (${stale}) — showing last known data`));
   }
@@ -460,6 +494,7 @@ async function cmdShow({ json = false, fresh = false } = {}) {
   if (!Object.keys(store.profiles).length) return onboard();
 
   const result = await gatherUsage({ fresh });
+  await attachSessionActivity(result.accounts);
   if (json) {
     console.log(JSON.stringify(result, null, 2));
     return;
@@ -562,7 +597,9 @@ function cmdServe(portArg) {
         if (url.searchParams.get('demo') === '1') {
           sendJson(res, 200, { accounts: demoAccounts() });
         } else {
-          sendJson(res, 200, await gatherUsage({ fresh: url.searchParams.get('fresh') === '1' }));
+          const result = await gatherUsage({ fresh: url.searchParams.get('fresh') === '1' });
+          await attachSessionActivity(result.accounts);
+          sendJson(res, 200, result);
         }
       } else if (url.pathname === '/api/sessions') {
         sendJson(res, 200, await collectSessions());
@@ -590,9 +627,9 @@ function demoAccounts() {
   const now = Date.now();
   const iso = (h) => new Date(now + h * 3600e3).toISOString();
   return [
-    { label: 'company-org1', identity: 'you@company.com · Org One', cachedMs: 0, data: { five_hour: { utilization: 8, resets_at: iso(2.3) }, seven_day: { utilization: 34, resets_at: iso(100) }, seven_day_opus: { utilization: 81, resets_at: iso(100) }, extra_usage: { is_enabled: true, monthly_limit: 35000, used_credits: 17586, utilization: 50.2, currency: 'USD', decimal_places: 2 } } },
+    { label: 'company-org1', identity: 'you@company.com · Org One', cachedMs: 0, lastSessionAt: new Date(now - 90e3).toISOString(), data: { five_hour: { utilization: 8, resets_at: iso(2.3) }, seven_day: { utilization: 34, resets_at: iso(100) }, seven_day_opus: { utilization: 81, resets_at: iso(100) }, extra_usage: { is_enabled: true, monthly_limit: 35000, used_credits: 17586, utilization: 50.2, currency: 'USD', decimal_places: 2 } } },
     { label: 'company-org2', identity: 'you@company.com · Org Two', cachedMs: 0, data: { five_hour: { utilization: 0, resets_at: null }, seven_day: { utilization: 3, resets_at: iso(52) } } },
-    { label: 'personal-1', identity: '', cachedMs: 45000, data: { five_hour: { utilization: 62, resets_at: iso(0.5) }, seven_day: { utilization: 91, resets_at: iso(12) } } },
+    { label: 'personal-1', identity: '', cachedMs: 45000, lastSessionAt: new Date(now - 26 * 3600e3).toISOString(), data: { five_hour: { utilization: 62, resets_at: iso(0.5) }, seven_day: { utilization: 91, resets_at: iso(12) } } },
     { label: 'personal-2', identity: '', cachedMs: 0, data: { __error: 'rate-limited by the usage endpoint — try again in a few minutes' } },
   ];
 }
@@ -670,7 +707,7 @@ const PAGE_HTML = `<!doctype html>
   }
   .card-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
   .card-head .label { font-weight: 600; }
-  .card-head .who, .card-head .age { color: var(--muted); font-size: 12px; }
+  .card-head .who, .card-head .age, .card-head .sess { color: var(--muted); font-size: 12px; }
   .card-head .age { margin-left: auto; }
   .meter { display: grid; grid-template-columns: 150px 1fr 46px minmax(150px, auto);
            align-items: center; gap: 10px; padding: 4px 0; }
@@ -751,6 +788,15 @@ function renderAccounts(result) {
     const head = el('div', 'card-head');
     head.append(el('span', 'label', acct.label));
     if (acct.identity) head.append(el('span', 'who', acct.identity));
+    if (acct.lastSessionAt) {
+      const ms = Math.max(0, Date.now() - new Date(acct.lastSessionAt));
+      if (ms < ${ACTIVE_WINDOW_MS}) {
+        head.append(el('span', 'badge', 'active'));
+        head.append(el('span', 'sess', fmtAge(ms) + ' ago'));
+      } else {
+        head.append(el('span', 'sess', 'last session ' + fmtAge(ms) + ' ago'));
+      }
+    }
     if (acct.cachedMs) {
       const age = acct.cachedMs < 120e3 ? Math.round(acct.cachedMs / 1000) + 's' : fmtRel(acct.cachedMs);
       head.append(el('span', 'age', 'cached ' + age + ' ago'));
@@ -857,10 +903,32 @@ function renderSessions(result) {
 }
 
 const DEMO = new URLSearchParams(location.search).has('demo');
+const state = { usage: null, sessions: null };
+
+// sessions refresh every 15s while usage every ~3min — re-join on the client so
+// the "active" badge tracks the fresher of the two
+function joinActivity() {
+  if (DEMO || !state.usage || !state.sessions) return;
+  for (const a of state.usage.accounts || []) {
+    const email = (a.email || '').toLowerCase();
+    if (!email) continue;
+    let latest = null;
+    for (const s of state.sessions.sessions || []) {
+      if (!s.account || !s.lastActiveAt) continue;
+      if ((s.account.email || '').toLowerCase() !== email) continue;
+      if (a.org && s.account.org && s.account.org !== a.org) continue;
+      if (!latest || s.lastActiveAt > latest) latest = s.lastActiveAt;
+    }
+    a.lastSessionAt = latest;
+  }
+}
+
 async function loadUsage(fresh) {
   try {
     const r = await fetch('/api/usage' + (DEMO ? '?demo=1' : fresh ? '?fresh=1' : ''));
-    renderAccounts(await r.json());
+    state.usage = await r.json();
+    joinActivity();
+    renderAccounts(state.usage);
   } catch (e) {
     document.getElementById('accounts').replaceChildren(
       el('div', 'empty', 'failed to load usage: ' + e.message));
@@ -869,7 +937,9 @@ async function loadUsage(fresh) {
 async function loadSessions() {
   try {
     const r = await fetch('/api/sessions');
-    renderSessions(await r.json());
+    state.sessions = await r.json();
+    renderSessions(state.sessions);
+    if (state.usage) { joinActivity(); renderAccounts(state.usage); }
   } catch (e) {
     document.getElementById('sessions').replaceChildren(
       el('div', 'empty', 'failed to load sessions: ' + e.message));
