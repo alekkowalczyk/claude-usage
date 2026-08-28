@@ -64,6 +64,13 @@ const WINDOW_LABELS = {
 };
 const WINDOW_ORDER = Object.keys(WINDOW_LABELS);
 
+// labels for the newer `limits` array (see windowsOf)
+const LIMIT_KIND_LABELS = {
+  session: 'Session (5h)',
+  weekly_all: 'Week (all models)',
+  weekly_scoped: 'Week',
+};
+
 const tildify = (p) => (p && p.startsWith(os.homedir()) ? '~' + p.slice(os.homedir().length) : p);
 
 // ---- storage -----------------------------------------------------------------
@@ -418,10 +425,33 @@ function bar(pct) {
   return paint('█'.repeat(filled)) + dim('░'.repeat(width - filled));
 }
 
+// Returns [{ label, utilization, resets_at, active }] in display order.
+//
+// The endpoint reports limits two ways. The `limits` array is the current
+// shape and the only place per-model weekly caps (Fable, ...) appear — the
+// legacy top-level seven_day_opus/seven_day_sonnet keys now come back null,
+// while unlabelled codename keys (nimbus_quill, ...) come back as noise.
+// Prefer `limits`; fall back to the top-level windows for older responses.
 function windowsOf(data) {
-  // windows can be null (e.g. seven_day_opus on non-Max plans); extra_usage is
-  // money-denominated and rendered separately — only render blocks with a
-  // numeric utilization
+  if (Array.isArray(data.limits) && data.limits.length) {
+    return data.limits
+      .filter((l) => l && typeof l.percent === 'number')
+      .map((l) => {
+        const sc = l.scope || {};
+        const scope = (sc.model && sc.model.display_name) ||
+          (sc.surface && (sc.surface.display_name || sc.surface)) || '';
+        const base = LIMIT_KIND_LABELS[l.kind] || String(l.kind || 'limit').replace(/_/g, ' ');
+        return {
+          label: l.kind === 'weekly_scoped' ? base + ' (' + (scope || 'scoped') + ')' : base,
+          utilization: l.percent,
+          resets_at: l.resets_at,
+          active: !!l.is_active,
+        };
+      });
+  }
+  // legacy shape: windows can be null (e.g. seven_day_opus on non-Max plans);
+  // extra_usage is money-denominated and rendered separately — only render
+  // blocks with a numeric utilization
   const entries = Object.entries(data).filter(
     ([k, v]) => k !== 'extra_usage' && v && typeof v === 'object' && typeof v.utilization === 'number',
   );
@@ -429,7 +459,12 @@ function windowsOf(data) {
     const ia = WINDOW_ORDER.indexOf(a); const ib = WINDOW_ORDER.indexOf(b);
     return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
   });
-  return entries;
+  return entries.map(([k, w]) => ({
+    label: WINDOW_LABELS[k] || k.replace(/_/g, ' '),
+    utilization: w.utilization,
+    resets_at: w.resets_at,
+    active: false,
+  }));
 }
 
 const fmtAge = (ms) => (ms < 120e3 ? Math.round(ms / 1000) + 's' : fmtRel(ms));
@@ -459,8 +494,8 @@ function renderAccount({ label, identity, data, cachedMs, stale, lastSessionAt }
   if (!wins.length) {
     console.log('  ' + dim('no usage windows in response'));
   }
-  for (const [key, w] of wins) {
-    const name = (WINDOW_LABELS[key] || key.replace(/_/g, ' ')).padEnd(19);
+  for (const w of wins) {
+    const name = w.label.padEnd(19);
     const pct = w.utilization;
     const pctStr = String(Math.round(pct)).padStart(3) + '%';
     console.log(`  ${name} ${bar(pct)} ${pctStr}   ${fmtResets(w.resets_at)}`);
@@ -627,7 +662,7 @@ function demoAccounts() {
   const now = Date.now();
   const iso = (h) => new Date(now + h * 3600e3).toISOString();
   return [
-    { label: 'company-org1', identity: 'you@company.com · Org One', cachedMs: 0, lastSessionAt: new Date(now - 90e3).toISOString(), data: { five_hour: { utilization: 8, resets_at: iso(2.3) }, seven_day: { utilization: 34, resets_at: iso(100) }, seven_day_opus: { utilization: 81, resets_at: iso(100) }, extra_usage: { is_enabled: true, monthly_limit: 35000, used_credits: 17586, utilization: 50.2, currency: 'USD', decimal_places: 2 } } },
+    { label: 'company-org1', identity: 'you@company.com · Org One', cachedMs: 0, lastSessionAt: new Date(now - 90e3).toISOString(), data: { limits: [{ kind: 'session', percent: 8, resets_at: iso(2.3) }, { kind: 'weekly_all', percent: 34, resets_at: iso(100) }, { kind: 'weekly_scoped', percent: 81, resets_at: iso(100), scope: { model: { display_name: 'Fable' } }, is_active: true }], extra_usage: { is_enabled: true, monthly_limit: 35000, used_credits: 17586, utilization: 50.2, currency: 'USD', decimal_places: 2 } } },
     { label: 'company-org2', identity: 'you@company.com · Org Two', cachedMs: 0, data: { five_hour: { utilization: 0, resets_at: null }, seven_day: { utilization: 3, resets_at: iso(52) } } },
     { label: 'personal-1', identity: '', cachedMs: 45000, lastSessionAt: new Date(now - 26 * 3600e3).toISOString(), data: { five_hour: { utilization: 62, resets_at: iso(0.5) }, seven_day: { utilization: 91, resets_at: iso(12) } } },
     { label: 'personal-2', identity: '', cachedMs: 0, data: { __error: 'rate-limited by the usage endpoint — try again in a few minutes' } },
@@ -750,6 +785,8 @@ const PAGE_HTML = `<!doctype html>
 <script>
 const WINDOW_LABELS = ${JSON.stringify(WINDOW_LABELS)};
 const WINDOW_ORDER = ${JSON.stringify(WINDOW_ORDER)};
+const LIMIT_KIND_LABELS = ${JSON.stringify(LIMIT_KIND_LABELS)};
+${windowsOf.toString()}
 
 const el = (tag, cls, text) => {
   const n = document.createElement(tag);
@@ -813,16 +850,11 @@ function renderAccounts(result) {
       w.append(el('span', 'icon', '⚠ '), document.createTextNode(acct.data.__error));
       card.append(w);
     } else {
-      const wins = Object.entries(acct.data)
-        .filter(([k, v]) => k !== 'extra_usage' && v && typeof v === 'object' && typeof v.utilization === 'number')
-        .sort(([a], [b]) => {
-          const ia = WINDOW_ORDER.indexOf(a), ib = WINDOW_ORDER.indexOf(b);
-          return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
-        });
+      const wins = windowsOf(acct.data);
       if (!wins.length) card.append(el('div', 'empty', 'no usage windows in response'));
-      for (const [key, w] of wins) {
+      for (const w of wins) {
         const row = el('div', 'meter');
-        row.append(el('span', 'win', WINDOW_LABELS[key] || key.replace(/_/g, ' ')));
+        row.append(el('span', 'win', w.label));
         const track = el('div', 'track');
         const fill = el('div', 'fill');
         const pct = Math.max(0, Math.min(100, w.utilization));

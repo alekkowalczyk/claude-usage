@@ -6,7 +6,7 @@ One terminal view of your Claude subscription usage limits across **multiple acc
 company-org1  (you@company.com · Org One)  ● active (2m ago)
   Session (5h)        ██░░░░░░░░░░░░░░░░░░   8%   resets in 2h 18m (Wed 09:08 PM)
   Week (all models)   ███████░░░░░░░░░░░░░  34%   resets in 4d 4h (Sun 10:50 PM)
-  Week (Opus)         ████████████████░░░░  81%   resets in 4d 4h (Sun 10:50 PM)
+  Week (Fable)        ████████████████░░░░  81%   resets in 4d 4h (Sun 10:50 PM)
   Extra usage (mo)    ██████████░░░░░░░░░░  50%   175.86 USD of 350.00 USD
 
 company-org2  (you@company.com · Org Two)
@@ -18,14 +18,14 @@ personal-1  [cached 45s ago]  last session 26h ago
   Week (all models)   ██████████████████░░  91%   resets in 12h 0m (Thu 06:50 AM)
 ```
 
-If you juggle several Claude subscriptions (a couple of company orgs, a personal Max plan…), checking how much headroom each one has left means logging in and out or hopping between machines. This tool stores an OAuth token per account and shows all the usage windows — the 5-hour session, the weekly all-models / Opus / Sonnet limits, and extra-usage spend — in one place.
+If you juggle several Claude subscriptions (a couple of company orgs, a personal Max plan…), checking how much headroom each one has left means logging in and out or hopping between machines. This tool stores an OAuth token per account and shows all the usage windows — the 5-hour session, the weekly all-models and per-model (Fable, Opus, …) limits, and extra-usage spend — in one place.
 
 > **Unofficial.** This uses the same OAuth flow and usage endpoint as the Claude Code CLI (`api.anthropic.com/api/oauth/usage`). The endpoints are undocumented, not supported by Anthropic, and may change or break at any time. Not affiliated with Anthropic.
 
 ## Features
 
 - **Multiple accounts** — label them however you like (`work-org1`, `personal`, …), each with its own OAuth token that auto-refreshes.
-- **All usage windows** — 5-hour session, weekly (all models / Opus / Sonnet / apps), and monthly extra-usage spend, with reset times.
+- **All usage windows** — 5-hour session, weekly (all models and per-model, e.g. Fable), and monthly extra-usage spend, with reset times.
 - **Web dashboard** — `claude-usage serve` gives you a self-refreshing localhost page with the same data.
 - **Running sessions** (macOS) — `claude-usage sessions` lists every running Claude Code process, which account and config dir it uses, its project directory, and when it was last active — sorted most-recent first, with an **● active** badge for sessions that did something in the last 15 minutes.
 - **Per-account activity** (macOS) — each account's usage card shows when a running session last used that account (matched by email + org), with an **● active** badge if it was within the last 15 minutes — so you can see at a glance which subscription is burning right now.
