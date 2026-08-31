@@ -4,6 +4,7 @@ One terminal view of your Claude subscription usage limits across **multiple acc
 
 ```
 company-org1  (you@company.com · Org One)  ● active (2m ago)
+  used by: this-laptop ~/.claude · build-box ~/.claude
   Session (5h)        ██░░░░░░░░░░░░░░░░░░   8%   resets in 2h 18m (Wed 09:08 PM)
   Week (all models)   ███████░░░░░░░░░░░░░  34%   resets in 4d 4h (Sun 10:50 PM)
   Week (Fable)        ████████████████░░░░  81%   resets in 4d 4h (Sun 10:50 PM)
@@ -14,6 +15,7 @@ company-org2  (you@company.com · Org Two)
   Week (all models)   █░░░░░░░░░░░░░░░░░░░   3%   resets in 2d 4h (Fri 10:50 PM)
 
 personal-1  [cached 45s ago]  last session 26h ago
+  used by: this-laptop ~/.claude-personal
   Session (5h)        ████████████░░░░░░░░  62%   resets in 30m (Wed 07:20 PM)
   Week (all models)   ██████████████████░░  91%   resets in 12h 0m (Thu 06:50 AM)
 ```
@@ -29,6 +31,7 @@ If you juggle several Claude subscriptions (a couple of company orgs, a personal
 - **Web dashboard** — `claude-usage serve` gives you a self-refreshing localhost page with the same data.
 - **Running sessions** (macOS) — `claude-usage sessions` lists every running Claude Code process, which account and config dir it uses, its project directory, and when it was last active — sorted most-recent first, with a **● busy** badge for sessions working right now. Activity comes from each session's own transcript records (via `<config dir>/sessions/<pid>.json`), not file timestamps, so idle sessions are not reported as active when Claude Code rewrites transcripts in bulk. A `~` marks the rare session whose activity could only be inferred from its project directory.
 - **Machines & config dirs** — `claude-usage machines` shows which account each Claude config dir is logged into (`~/.claude`, `~/.claude-work`, `~/.claude-2`, …), on this machine and on any remote host you register. Handy when you run several logins side by side and want to know which one a shell will pick up.
+- **`used by` on every account** — the main output puts the config dirs using each account right under its name, so you can see which login on which machine is spending that subscription. Hosts are probed concurrently and cached for 60 seconds, so this costs a fraction of a second; an unreachable host is reported once at the end instead of on every account.
 - **Per-account activity** (macOS) — each account's usage card shows when a running session last used that account (matched by email + org), with an **● active** badge if it was within the last 15 minutes — so you can see at a glance which subscription is burning right now.
 - **Polite to the API** — results are cached for 2 minutes and fetches are spaced out, because the usage endpoint rate-limits aggressively.
 - **Zero dependencies** — a single executable Node script.

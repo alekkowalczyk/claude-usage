@@ -394,36 +394,81 @@ function runProbe(sshTarget) {
   });
 }
 
+// Hosts are probed concurrently: the cost of a machines lookup is the slowest
+// host, not the sum of all of them. Failures are cached for the same TTL as
+// successes — otherwise a host that is simply down would re-pay the SSH connect
+// timeout on every single invocation.
 async function collectMachines({ fresh = false } = {}) {
   const hosts = loadHosts();
   const cache = readCache();
-  const machines = [];
+  const goodKey = (n) => 'host:' + n;
+  const failKey = (n) => 'hostfail:' + n;
+  const isFresh = (c) => c && Date.now() - c.at < HOST_CACHE_TTL_MS;
 
-  const local = await runProbe(null);
-  machines.push({
-    name: String(local.hostname || os.hostname()).split('.')[0], local: true, target: null,
+  const localP = runProbe(null).then((local) => ({
+    name: String(local.hostname || os.hostname()).split('.')[0],
+    local: true, target: null,
     dirs: local.dirs || [], error: local.error || null, cachedMs: 0,
-  });
+  }));
 
-  for (const [name, cfg] of Object.entries(hosts)) {
-    const key = 'host:' + name;
-    const c = cache[key];
-    if (!fresh && c && Date.now() - c.at < HOST_CACHE_TTL_MS) {
-      machines.push({ ...c.result, name, local: false, target: cfg.ssh, cachedMs: Date.now() - c.at });
-      continue;
+  const remoteP = Object.entries(hosts).map(async ([name, cfg]) => {
+    const base = { name, local: false, target: cfg.ssh };
+    const good = cache[goodKey(name)];
+    const fail = cache[failKey(name)];
+    // a recent success wins outright
+    if (!fresh && isFresh(good)) {
+      return { ...good.result, ...base, cachedMs: Date.now() - good.at };
+    }
+    // a recent failure means don't dial again yet — show the last good data if
+    // there is any, flagged stale, otherwise just the error
+    if (!fresh && isFresh(fail)) {
+      return good
+        ? { ...good.result, ...base, cachedMs: Date.now() - good.at, stale: fail.error }
+        : { ...base, dirs: [], error: fail.error, cachedMs: 0 };
     }
     const r = await runProbe(cfg.ssh);
-    const result = { dirs: r.dirs || [], error: r.error || null, hostname: r.hostname || null };
-    if (!result.error) cache[key] = { at: Date.now(), result };
-    else if (c) { // stale-if-error, same policy as the usage cache
-      machines.push({ ...c.result, name, local: false, target: cfg.ssh,
-        cachedMs: Date.now() - c.at, stale: result.error });
-      continue;
+    if (r.error) {
+      cache[failKey(name)] = { at: Date.now(), error: r.error };
+      return good
+        ? { ...good.result, ...base, cachedMs: Date.now() - good.at, stale: r.error }
+        : { ...base, dirs: [], error: r.error, cachedMs: 0 };
     }
-    machines.push({ ...result, name, local: false, target: cfg.ssh, cachedMs: 0 });
-  }
+    const result = { dirs: r.dirs || [], hostname: r.hostname || null, error: null };
+    cache[goodKey(name)] = { at: Date.now(), result };
+    delete cache[failKey(name)];
+    return { ...result, ...base, cachedMs: 0 };
+  });
+
+  const machines = await Promise.all([localP, ...remoteP]);
   writeCache(cache);
   return { machines, generatedAt: new Date().toISOString() };
+}
+
+// Join config dirs to accounts by (email, org) — the same rule
+// attachSessionActivity uses: org must match only when both sides know it,
+// because one email can belong to several orgs.
+// Unreachable hosts are reported separately: when a probe fails we cannot know
+// which accounts that machine uses, so the warning belongs to no single account.
+async function attachMachineUsage(accounts) {
+  let machines = [];
+  try { ({ machines } = await collectMachines()); } catch { return []; }
+  for (const acct of accounts) {
+    const email = (acct.email || '').toLowerCase();
+    const usedBy = [];
+    if (email) {
+      for (const m of machines) {
+        for (const d of m.dirs || []) {
+          if (!d.email || d.email.toLowerCase() !== email) continue;
+          if (acct.org && d.org && d.org !== acct.org) continue;
+          usedBy.push({ machine: m.name, local: !!m.local, configDir: d.configDir });
+        }
+      }
+    }
+    acct.usedBy = usedBy;
+  }
+  return machines
+    .filter((m) => m.error || m.stale)
+    .map((m) => ({ name: m.name, error: m.error || m.stale, partial: !m.error }));
 }
 
 // ---- running Claude Code sessions (macOS) ---------------------------------------
@@ -679,7 +724,38 @@ function windowsOf(data) {
 
 const fmtAge = (ms) => (ms < 120e3 ? Math.round(ms / 1000) + 's' : fmtRel(ms));
 
-function renderAccount({ label, identity, data, cachedMs, stale, lastSessionAt }) {
+// "used by: <machine> <config dir> · …", wrapped to the terminal. Widths are
+// measured on the plain text — the coloured strings carry ANSI escapes.
+function usedByLines(usedBy) {
+  if (!usedBy || !usedBy.length) return [];
+  const LABEL = 'used by: ';
+  const width = Math.max(40, (isTTY && process.stdout.columns) || 80);
+  const avail = width - 2 - LABEL.length; // 2 = the standard body indent
+  // several config dirs on one machine collapse into a single entry
+  const byMachine = new Map();
+  for (const u of usedBy) {
+    if (!byMachine.has(u.machine)) byMachine.set(u.machine, []);
+    byMachine.get(u.machine).push(u.configDir);
+  }
+  const parts = [...byMachine].map(([machine, dirs]) => ({
+    plain: `${machine} ${dirs.join(', ')}`,
+    text: machine + ' ' + dirs.map((d) => cyan(d)).join(dim(', ')),
+  }));
+  const rows = [];
+  let plain = ''; let text = '';
+  for (const part of parts) {
+    const sepLen = plain ? 3 : 0; // " · "
+    if (plain && plain.length + sepLen + part.plain.length > avail) {
+      rows.push(text); plain = ''; text = '';
+    }
+    if (plain) { plain += ' · '; text += dim(' · '); }
+    plain += part.plain; text += part.text;
+  }
+  if (text) rows.push(text);
+  return rows.map((r, i) => '  ' + (i === 0 ? dim(LABEL) : ' '.repeat(LABEL.length)) + r);
+}
+
+function renderAccount({ label, identity, data, cachedMs, stale, lastSessionAt, usedBy }) {
   const age = cachedMs ? dim(`  [cached ${fmtAge(cachedMs)} ago]`) : '';
   let act = '';
   if (lastSessionAt) {
@@ -689,6 +765,7 @@ function renderAccount({ label, identity, data, cachedMs, stale, lastSessionAt }
       : '  ' + dim(`last session ${fmtAge(ms)} ago`);
   }
   console.log(bold(label) + (identity ? dim(`  (${identity})`) : '') + age + act);
+  for (const line of usedByLines(usedBy)) console.log(line);
   if (stale) {
     console.log('  ' + yellow(`⚠ refresh failed (${stale}) — showing last known data`));
   }
@@ -739,13 +816,24 @@ async function cmdShow({ json = false, fresh = false } = {}) {
   if (!Object.keys(store.profiles).length) return onboard();
 
   const result = await gatherUsage({ fresh });
-  await attachSessionActivity(result.accounts);
+  const [, machineWarnings] = await Promise.all([
+    attachSessionActivity(result.accounts),
+    attachMachineUsage(result.accounts),
+  ]);
   if (json) {
-    console.log(JSON.stringify(result, null, 2));
+    console.log(JSON.stringify({ ...result, machineWarnings }, null, 2));
     return;
   }
   console.log('');
   for (const acct of result.accounts) renderAccount(acct);
+  // Host failures are reported once, here, rather than per account: when a probe
+  // fails we do not know which accounts that machine uses.
+  for (const w of machineWarnings) {
+    console.log(yellow(w.partial
+      ? `⚠ ${w.name}: refresh failed (${w.error}) — showing its last known config dirs`
+      : `⚠ ${w.name}: unreachable (${w.error}) — its config dirs are not shown`));
+  }
+  if (machineWarnings.length) console.log('');
 }
 
 async function onboard() {
@@ -853,8 +941,11 @@ function cmdServe(portArg) {
           sendJson(res, 200, { accounts: demoAccounts() });
         } else {
           const result = await gatherUsage({ fresh: url.searchParams.get('fresh') === '1' });
-          await attachSessionActivity(result.accounts);
-          sendJson(res, 200, result);
+          const [, machineWarnings] = await Promise.all([
+            attachSessionActivity(result.accounts),
+            attachMachineUsage(result.accounts),
+          ]);
+          sendJson(res, 200, { ...result, machineWarnings });
         }
       } else if (url.pathname === '/api/sessions') {
         sendJson(res, 200, await collectSessions());
@@ -938,9 +1029,9 @@ function demoAccounts() {
   const now = Date.now();
   const iso = (h) => new Date(now + h * 3600e3).toISOString();
   return [
-    { label: 'company-org1', identity: 'you@company.com · Org One', cachedMs: 0, lastSessionAt: new Date(now - 90e3).toISOString(), data: { limits: [{ kind: 'session', percent: 8, resets_at: iso(2.3) }, { kind: 'weekly_all', percent: 34, resets_at: iso(100) }, { kind: 'weekly_scoped', percent: 81, resets_at: iso(100), scope: { model: { display_name: 'Fable' } }, is_active: true }], extra_usage: { is_enabled: true, monthly_limit: 35000, used_credits: 17586, utilization: 50.2, currency: 'USD', decimal_places: 2 } } },
+    { label: 'company-org1', identity: 'you@company.com · Org One', cachedMs: 0, lastSessionAt: new Date(now - 90e3).toISOString(), usedBy: [{ machine: 'this-laptop', local: true, configDir: '~/.claude' }, { machine: 'build-box', local: false, configDir: '~/.claude' }], data: { limits: [{ kind: 'session', percent: 8, resets_at: iso(2.3) }, { kind: 'weekly_all', percent: 34, resets_at: iso(100) }, { kind: 'weekly_scoped', percent: 81, resets_at: iso(100), scope: { model: { display_name: 'Fable' } }, is_active: true }], extra_usage: { is_enabled: true, monthly_limit: 35000, used_credits: 17586, utilization: 50.2, currency: 'USD', decimal_places: 2 } } },
     { label: 'company-org2', identity: 'you@company.com · Org Two', cachedMs: 0, data: { five_hour: { utilization: 0, resets_at: null }, seven_day: { utilization: 3, resets_at: iso(52) } } },
-    { label: 'personal-1', identity: '', cachedMs: 45000, lastSessionAt: new Date(now - 26 * 3600e3).toISOString(), data: { five_hour: { utilization: 62, resets_at: iso(0.5) }, seven_day: { utilization: 91, resets_at: iso(12) } } },
+    { label: 'personal-1', identity: '', cachedMs: 45000, lastSessionAt: new Date(now - 26 * 3600e3).toISOString(), usedBy: [{ machine: 'this-laptop', local: true, configDir: '~/.claude-personal' }], data: { five_hour: { utilization: 62, resets_at: iso(0.5) }, seven_day: { utilization: 91, resets_at: iso(12) } } },
     { label: 'personal-2', identity: '', cachedMs: 0, data: { __error: 'rate-limited by the usage endpoint — try again in a few minutes' } },
   ];
 }
@@ -1042,6 +1133,8 @@ const PAGE_HTML = `<!doctype html>
   tr:last-child td { border-bottom: none; }
   td.num { font-variant-numeric: tabular-nums; }
   td .cfg { color: var(--ink-2); }
+  .usedby { color: var(--muted); font-size: 12px; margin: -2px 0 10px; }
+  .usedby .cfg { color: var(--ink-2); }
   .badge { display: inline-flex; align-items: center; gap: 5px; color: var(--good);
            font-size: 12px; font-weight: 600; }
   .badge::before { content: ''; width: 7px; height: 7px; border-radius: 50%;
@@ -1123,6 +1216,27 @@ function renderAccounts(result) {
       head.append(el('span', 'age', 'cached ' + age + ' ago'));
     }
     card.append(head);
+    if (acct.usedBy && acct.usedBy.length) {
+      // several config dirs on one machine collapse into a single entry
+      const byMachine = new Map();
+      for (const u of acct.usedBy) {
+        if (!byMachine.has(u.machine)) byMachine.set(u.machine, []);
+        byMachine.get(u.machine).push(u.configDir);
+      }
+      const line = el('div', 'usedby');
+      line.append(document.createTextNode('used by: '));
+      let firstMachine = true;
+      for (const [machine, dirs] of byMachine) {
+        if (!firstMachine) line.append(document.createTextNode(' · '));
+        firstMachine = false;
+        line.append(document.createTextNode(machine + ' '));
+        dirs.forEach((d, i) => {
+          if (i) line.append(document.createTextNode(', '));
+          line.append(el('span', 'cfg', d));
+        });
+      }
+      card.append(line);
+    }
     if (acct.stale) {
       const w = el('div', 'warnline');
       w.append(el('span', 'icon', '⚠ '),
@@ -1270,7 +1384,7 @@ function renderMachines(result) {
 }
 
 const DEMO = new URLSearchParams(location.search).has('demo');
-const state = { usage: null, sessions: null };
+const state = { usage: null, sessions: null, machines: null };
 
 // sessions refresh every 15s while usage every ~3min — re-join on the client so
 // the "active" badge tracks the fresher of the two
@@ -1290,11 +1404,32 @@ function joinActivity() {
   }
 }
 
+// machines refresh every 60s and usage every ~3min — re-join on the client so
+// the "used by" line tracks the fresher of the two (mirrors joinActivity)
+function joinMachines() {
+  if (DEMO || !state.usage || !state.machines) return;
+  for (const a of state.usage.accounts || []) {
+    const email = (a.email || '').toLowerCase();
+    const usedBy = [];
+    if (email) {
+      for (const m of state.machines.machines || []) {
+        for (const d of m.dirs || []) {
+          if (!d.email || d.email.toLowerCase() !== email) continue;
+          if (a.org && d.org && d.org !== a.org) continue;
+          usedBy.push({ machine: m.name, local: !!m.local, configDir: d.configDir });
+        }
+      }
+    }
+    a.usedBy = usedBy;
+  }
+}
+
 async function loadUsage(fresh) {
   try {
     const r = await fetch('/api/usage' + (DEMO ? '?demo=1' : fresh ? '?fresh=1' : ''));
     state.usage = await r.json();
     joinActivity();
+    joinMachines();
     renderAccounts(state.usage);
   } catch (e) {
     document.getElementById('accounts').replaceChildren(
@@ -1316,7 +1451,9 @@ async function loadSessions() {
 async function loadMachines(fresh) {
   try {
     const r = await fetch('/api/machines' + (fresh ? '?fresh=1' : ''));
-    renderMachines(await r.json());
+    state.machines = await r.json();
+    renderMachines(state.machines);
+    if (state.usage) { joinMachines(); renderAccounts(state.usage); }
   } catch (e) {
     document.getElementById('machines').replaceChildren(
       el('div', 'empty', 'failed to load machines: ' + e.message));
