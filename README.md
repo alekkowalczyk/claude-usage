@@ -27,7 +27,8 @@ If you juggle several Claude subscriptions (a couple of company orgs, a personal
 - **Multiple accounts** — label them however you like (`work-org1`, `personal`, …), each with its own OAuth token that auto-refreshes.
 - **All usage windows** — 5-hour session, weekly (all models and per-model, e.g. Fable), and monthly extra-usage spend, with reset times.
 - **Web dashboard** — `claude-usage serve` gives you a self-refreshing localhost page with the same data.
-- **Running sessions** (macOS) — `claude-usage sessions` lists every running Claude Code process, which account and config dir it uses, its project directory, and when it was last active — sorted most-recent first, with an **● active** badge for sessions that did something in the last 15 minutes.
+- **Running sessions** (macOS) — `claude-usage sessions` lists every running Claude Code process, which account and config dir it uses, its project directory, and when it was last active — sorted most-recent first, with a **● busy** badge for sessions working right now. Activity comes from each session's own transcript records (via `<config dir>/sessions/<pid>.json`), not file timestamps, so idle sessions are not reported as active when Claude Code rewrites transcripts in bulk. A `~` marks the rare session whose activity could only be inferred from its project directory.
+- **Machines & config dirs** — `claude-usage machines` shows which account each Claude config dir is logged into (`~/.claude`, `~/.claude-work`, `~/.claude-2`, …), on this machine and on any remote host you register. Handy when you run several logins side by side and want to know which one a shell will pick up.
 - **Per-account activity** (macOS) — each account's usage card shows when a running session last used that account (matched by email + org), with an **● active** badge if it was within the last 15 minutes — so you can see at a glance which subscription is burning right now.
 - **Polite to the API** — results are cached for 2 minutes and fetches are spaced out, because the usage endpoint rate-limits aggressively.
 - **Zero dependencies** — a single executable Node script.
@@ -51,11 +52,39 @@ claude-usage login NAME   add / re-authenticate an account
 claude-usage remove NAME  forget an account
 claude-usage list         list stored accounts
 claude-usage sessions     running Claude Code sessions, most recently active first
+claude-usage machines     which account each config dir is logged into, here and remotely
+claude-usage host add NAME SSH-TARGET   watch a remote machine over ssh
+claude-usage host remove NAME           stop watching it
+claude-usage host list                  list registered machines
 claude-usage serve [port] web dashboard on http://localhost:7788 (localhost only)
 claude-usage --json       machine-readable output
 claude-usage --fresh      bypass the 2-minute result cache
 claude-usage --demo       render sample output (no network, no login)
 ```
+
+### Several logins, several machines
+
+Claude Code keeps each login in its own config dir, selected with `CLAUDE_CONFIG_DIR`. `machines` shows what is in each of them:
+
+```
+$ claude-usage machines
+
+Aleksanders-MBP (local)
+  ~/.claude             alek@gmail.com · Personal
+  ~/.claude-work        aleksander@munu.cloud · MunuPL
+
+ubuntu-srv (alek@ubuntu-srv)  [cached 42s ago]
+  ~/.claude             piotrek@munu.cloud · MunuPL
+  ~/.claude-2           aleksander@munu.cloud · Munu
+```
+
+Register a remote machine with any target your `ssh` already understands:
+
+```sh
+claude-usage host add ubuntu-srv alek@ubuntu-srv   # or an ~/.ssh/config alias
+```
+
+Each host is read with **one short SSH command** that runs a small POSIX-sh probe — nothing is installed on the remote. The probe needs `node` or `python3` there (either is enough) and extracts **only** the account email and organization name; it never reads `.credentials.json` or the keychain, so no token leaves the machine it belongs to. Host key checking is left at the SSH default, so connect once by hand first. Unreachable hosts get a warning row and never block the others, and remote results are cached for 60 seconds.
 
 On first run it walks you through logging in each account: it opens the standard `claude.ai` OAuth consent page in your browser and asks you to paste back the authorization code. To add an account under a different claude.ai login (or to pick a specific org), open the printed URL in a private window or another browser profile.
 

@@ -45,6 +45,9 @@ const CACHE_TTL_MS = 120 * 1000; // ~180s is the community-reported safe poll in
 const REFRESH_SLACK_MS = 2 * 60 * 1000;
 const ACTIVE_WINDOW_MS = 15 * 60 * 1000; // sessions touched within this get an "active" badge
 const DEFAULT_PORT = 7788;
+const HOST_CACHE_TTL_MS = 60 * 1000; // remote probe: at most one ssh per host per minute
+const PROBE_TIMEOUT_MS = 12000;
+const TAIL_BYTES = 64 * 1024; // plenty to hold a transcript's last record
 
 const isTTY = process.stdout.isTTY;
 const color = (code, s) => (isTTY ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -86,6 +89,30 @@ function saveStore(store) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   fs.writeFileSync(PROFILES_PATH, JSON.stringify(store, null, 2) + '\n');
   fs.chmodSync(PROFILES_PATH, 0o600);
+}
+
+function readCache() {
+  try { return JSON.parse(fs.readFileSync(CACHE_PATH, 'utf8')); } catch { return {}; }
+}
+
+function writeCache(cache) {
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(CACHE_PATH, JSON.stringify(cache));
+    fs.chmodSync(CACHE_PATH, 0o600);
+  } catch {}
+}
+
+// hosts are keyed by the name you give them; { ssh: '<target>' }
+function loadHosts() {
+  const h = loadStore().hosts;
+  return h && typeof h === 'object' ? h : {};
+}
+
+function saveHosts(hosts) {
+  const store = loadStore();
+  store.hosts = hosts;
+  saveStore(store);
 }
 
 // ---- oauth login ---------------------------------------------------------------
@@ -239,8 +266,7 @@ async function fetchUsageWithRetry(label, store, attempts = 3) {
 async function gatherUsage({ fresh = false } = {}) {
   const store = loadStore();
   const labels = Object.keys(store.profiles);
-  let cache = {};
-  try { cache = JSON.parse(fs.readFileSync(CACHE_PATH, 'utf8')); } catch {}
+  const cache = readCache();
 
   const accounts = [];
   let fetchedAny = false;
@@ -272,12 +298,132 @@ async function gatherUsage({ fresh = false } = {}) {
       cachedMs, stale, data,
     });
   }
-  try {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(CACHE_PATH, JSON.stringify(cache));
-    fs.chmodSync(CACHE_PATH, 0o600);
-  } catch {}
+  writeCache(cache);
   return { accounts };
+}
+
+// ---- machines: which account each Claude config dir is logged into ---------------
+// One POSIX-sh probe, fed to `sh -s` locally and `ssh <target> sh -s` remotely, so
+// both paths discover config dirs identically. It prints "<dir>\t<json>" per dir
+// (or "<dir>\t!<reason>"), preceded by "#host" and "#home".
+//
+// Extraction happens on the far side and yields only the account email and org:
+// .claude.json also holds project history, and credentials live elsewhere
+// (keychain / .credentials.json) and are never read. String.raw keeps the shell's
+// backslash escapes intact — do not introduce ${...} into this literal.
+const PROBE_SH = String.raw`
+set -u
+H=$HOME
+[ -n "$H" ] || exit 1
+printf '#host\t%s\n' "$(hostname 2>/dev/null || echo unknown)"
+printf '#home\t%s\n' "$H"
+{
+  printf '%s\n' "$H/.claude"
+  for d in "$H"/.claude-*; do [ -d "$d" ] && printf '%s\n' "$d"; done
+  # config dirs of running sessions, which may live outside $HOME
+  if [ -d /proc ]; then
+    for e in /proc/[0-9]*/environ; do tr '\0' '\n' < "$e" 2>/dev/null; done \
+      | sed -n 's/^CLAUDE_CONFIG_DIR=//p'
+  else
+    ps -Eww -o args= 2>/dev/null | tr ' ' '\n' | sed -n 's/^CLAUDE_CONFIG_DIR=//p'
+  fi
+} | sed 's:/*$::' | sort -u | while IFS= read -r d; do
+  [ -n "$d" ] || continue
+  f="$d/.claude.json"
+  # the default dir is the odd one out: its config sits at ~/.claude.json
+  if [ "$d" = "$H/.claude" ] && [ -f "$H/.claude.json" ]; then f="$H/.claude.json"; fi
+  if [ ! -f "$f" ]; then printf '%s\t!no config file\n' "$d"; continue; fi
+  if command -v node >/dev/null 2>&1; then
+    out=$(node -e 'const fs=require("fs");try{const a=JSON.parse(fs.readFileSync(process.argv[1],"utf8")).oauthAccount||{};process.stdout.write(JSON.stringify({email:a.emailAddress||a.email_address||null,org:a.organizationName||a.organization_name||null}))}catch(e){process.exit(1)}' "$f" 2>/dev/null)
+  elif command -v python3 >/dev/null 2>&1; then
+    out=$(python3 -c 'import json,sys
+try:
+ a=json.load(open(sys.argv[1])).get("oauthAccount") or {}
+ sys.stdout.write(json.dumps({"email":a.get("emailAddress") or a.get("email_address"),"org":a.get("organizationName") or a.get("organization_name")}))
+except Exception: sys.exit(1)' "$f" 2>/dev/null)
+  else
+    printf '%s\t!needs node or python3 on the host to read the config\n' "$d"; continue
+  fi
+  if [ -z "$out" ]; then printf '%s\t!unreadable config\n' "$d"
+  else printf '%s\t%s\n' "$d" "$out"; fi
+done
+`;
+
+function parseProbe(out) {
+  let hostname = null; let home = null;
+  const dirs = [];
+  for (const line of out.split('\n')) {
+    const tab = line.indexOf('\t');
+    if (tab < 0) continue;
+    const key = line.slice(0, tab); const val = line.slice(tab + 1).trim();
+    if (key === '#host') { hostname = val || null; continue; }
+    if (key === '#home') { home = val || null; continue; }
+    if (val.startsWith('!')) { dirs.push({ configDir: key, error: val.slice(1) }); continue; }
+    try {
+      const j = JSON.parse(val);
+      dirs.push({ configDir: key, email: j.email || null, org: j.org || null });
+    } catch { dirs.push({ configDir: key, error: 'unparseable probe output' }); }
+  }
+  // shorten with the *remote* home — tildify() only knows this machine's
+  if (home) {
+    for (const d of dirs) {
+      if (d.configDir.startsWith(home)) d.configDir = '~' + d.configDir.slice(home.length);
+    }
+  }
+  return { hostname, dirs };
+}
+
+// sshTarget null ⇒ probe this machine. Host key checking is deliberately left at
+// its default: an unknown host should fail loudly, not be trusted on first sight.
+function runProbe(sshTarget) {
+  return new Promise((resolve) => {
+    const args = sshTarget
+      ? ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', sshTarget, 'sh -s']
+      : ['-s'];
+    const child = execFile(sshTarget ? 'ssh' : 'sh', args,
+      { timeout: PROBE_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err && !String(stdout).includes('\t')) {
+          const why = String(stderr || '').trim().split('\n').filter(Boolean).pop() ||
+            (err.killed ? 'timed out' : err.message);
+          return resolve({ error: why.slice(0, 140) });
+        }
+        resolve(parseProbe(String(stdout)));
+      });
+    try { child.stdin.end(PROBE_SH); } catch {}
+  });
+}
+
+async function collectMachines({ fresh = false } = {}) {
+  const hosts = loadHosts();
+  const cache = readCache();
+  const machines = [];
+
+  const local = await runProbe(null);
+  machines.push({
+    name: String(local.hostname || os.hostname()).split('.')[0], local: true, target: null,
+    dirs: local.dirs || [], error: local.error || null, cachedMs: 0,
+  });
+
+  for (const [name, cfg] of Object.entries(hosts)) {
+    const key = 'host:' + name;
+    const c = cache[key];
+    if (!fresh && c && Date.now() - c.at < HOST_CACHE_TTL_MS) {
+      machines.push({ ...c.result, name, local: false, target: cfg.ssh, cachedMs: Date.now() - c.at });
+      continue;
+    }
+    const r = await runProbe(cfg.ssh);
+    const result = { dirs: r.dirs || [], error: r.error || null, hostname: r.hostname || null };
+    if (!result.error) cache[key] = { at: Date.now(), result };
+    else if (c) { // stale-if-error, same policy as the usage cache
+      machines.push({ ...c.result, name, local: false, target: cfg.ssh,
+        cachedMs: Date.now() - c.at, stale: result.error });
+      continue;
+    }
+    machines.push({ ...result, name, local: false, target: cfg.ssh, cachedMs: 0 });
+  }
+  writeCache(cache);
+  return { machines, generatedAt: new Date().toISOString() };
 }
 
 // ---- running Claude Code sessions (macOS) ---------------------------------------
@@ -315,21 +461,75 @@ function readConfigIdentity(configDir) {
   return null;
 }
 
-// Claude Code appends each session's transcript to
-// <configDir>/projects/<cwd with non-alphanumerics as '-'>/*.jsonl, so the
-// newest transcript mtime for a session's cwd is its last activity. Sessions
-// sharing a cwd share that directory — close enough for a freshness badge.
-function lastActivityAt(configDir, cwd) {
+// Claude Code keeps per-process state at <configDir>/sessions/<pid>.json holding
+// the session id, cwd and an idle/busy status. It is the only reliable pid →
+// transcript link: transcripts are named by session id and are not held open, so
+// lsof cannot match them, and several sessions routinely share one project dir.
+// Stale files for dead pids linger, so the caller must have confirmed the pid.
+function sessionState(configDir, pid) {
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(configDir, 'sessions', pid + '.json'), 'utf8'));
+    return j && j.pid === pid ? j : null;
+  } catch { return null; }
+}
+
+const projectDir = (configDir, cwd) =>
+  path.join(configDir, 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'));
+
+// Last activity is the newest record's own timestamp, never the file's mtime:
+// Claude Code rewrites transcripts in bulk during maintenance, which bumps the
+// mtime of long-idle sessions and makes every one of them look active.
+// Transcripts reach tens of MB, so only the tail is read.
+function lastRecordTimestamp(file) {
+  if (!file) return null;
+  let st;
+  try { st = fs.statSync(file); } catch { return null; }
+  const len = Math.min(TAIL_BYTES, st.size);
+  if (!len) return null;
+  const buf = Buffer.alloc(len);
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    fs.readSync(fd, buf, 0, len, st.size - len);
+  } catch { return null; } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+  }
+  // walk back to the newest line that parses — the first line is usually a
+  // fragment, and trailing lines can be torn if a session is mid-write
+  const lines = buf.toString('utf8').split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].startsWith('{')) continue;
+    let j;
+    try { j = JSON.parse(lines[i]); } catch { continue; }
+    const t = j && typeof j.timestamp === 'string' ? Date.parse(j.timestamp) : NaN;
+    if (!isNaN(t)) return new Date(t).toISOString();
+  }
+  return null;
+}
+
+// Fallback when a session has no state file: the newest record across the
+// project's transcripts. Shared by every session in that cwd, hence approximate.
+function newestRecordInProject(configDir, cwd) {
   if (!cwd) return null;
-  const dir = path.join(configDir, 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'));
+  const dir = projectDir(configDir, cwd);
   let entries;
   try { entries = fs.readdirSync(dir); } catch { return null; }
-  let latest = 0;
-  for (const f of entries) {
-    if (!f.endsWith('.jsonl')) continue;
-    try { latest = Math.max(latest, fs.statSync(path.join(dir, f)).mtimeMs); } catch {}
+  // mtime is a poor activity signal but a fine search order — only the few
+  // most recently touched transcripts are worth opening
+  const recent = entries.filter((f) => f.endsWith('.jsonl'))
+    .map((f) => {
+      const fp = path.join(dir, f);
+      try { return { fp, m: fs.statSync(fp).mtimeMs }; } catch { return null; }
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.m - a.m)
+    .slice(0, 5);
+  let latest = null;
+  for (const r of recent) {
+    const t = lastRecordTimestamp(r.fp);
+    if (t && (!latest || t > latest)) latest = t;
   }
-  return latest ? new Date(latest).toISOString() : null;
+  return latest;
 }
 
 async function collectSessions() {
@@ -365,11 +565,21 @@ async function collectSessions() {
     const configDir = envMatch ? envMatch[1] : path.join(os.homedir(), '.claude');
     const startedAt = new Date(s.lstart);
     const started = isNaN(startedAt) ? null : startedAt.toISOString();
-    const cwd = cwds[s.pid] || null;
+    const state = sessionState(configDir, s.pid);
+    const cwd = (state && state.cwd) || cwds[s.pid] || null;
+    // exact when the state file named this session's own transcript
+    let lastActiveAt = state && state.sessionId
+      ? lastRecordTimestamp(path.join(projectDir(configDir, cwd || ''), state.sessionId + '.jsonl'))
+      : null;
+    const precise = !!lastActiveAt;
+    if (!lastActiveAt) lastActiveAt = newestRecordInProject(configDir, cwd);
     results.push({
       pid: s.pid,
       startedAt: started,
-      lastActiveAt: lastActivityAt(configDir, cwd) || started,
+      lastActiveAt: lastActiveAt || started,
+      preciseActivity: precise,
+      status: (state && state.status) || null,
+      sessionName: (state && state.name) || null,
       configDir: tildify(configDir),
       account: readConfigIdentity(configDir),
       cwd: tildify(cwd),
@@ -597,12 +807,18 @@ async function cmdSessions() {
   const trunc = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + '…' : s || '');
   console.log('');
   console.log(dim('PID'.padEnd(8) + 'CONFIG'.padEnd(18) + 'ACCOUNT'.padEnd(34) + 'PROJECT'.padEnd(34) + 'LAST ACTIVE'.padEnd(16) + 'UP'));
+  let anyApprox = false;
   for (const s of sessions) {
     const who = s.account ? [s.account.email, s.account.org].filter(Boolean).join(' · ') : 'unknown';
     const up = s.startedAt ? fmtRel(Date.now() - new Date(s.startedAt)) : '';
     const idleMs = s.lastActiveAt ? Math.max(0, Date.now() - new Date(s.lastActiveAt)) : null;
-    const active = idleMs !== null && idleMs < ACTIVE_WINDOW_MS;
-    const last = idleMs === null ? '-' : (active ? '● ' : '') + fmtAge(idleMs) + ' ago';
+    const busy = s.status === 'busy';
+    const approx = idleMs !== null && !s.preciseActivity;
+    if (approx) anyApprox = true;
+    const active = busy || (idleMs !== null && idleMs < ACTIVE_WINDOW_MS);
+    const last = busy ? '● busy'
+      : idleMs === null ? '-'
+      : (approx ? '~' : '') + fmtAge(idleMs) + ' ago';
     console.log(
       String(s.pid).padEnd(8) +
       trunc(s.configDir, 16).padEnd(18) +
@@ -611,6 +827,10 @@ async function cmdSessions() {
       (active ? green(last.padEnd(16)) : dim(last.padEnd(16))) +
       dim(up),
     );
+  }
+  if (anyApprox) {
+    console.log('\n' + dim('~ approximate — no per-session state file, so this is the newest'));
+    console.log(dim('  activity across every session sharing that project directory.'));
   }
   console.log('');
 }
@@ -638,6 +858,8 @@ function cmdServe(portArg) {
         }
       } else if (url.pathname === '/api/sessions') {
         sendJson(res, 200, await collectSessions());
+      } else if (url.pathname === '/api/machines') {
+        sendJson(res, 200, await collectMachines({ fresh: url.searchParams.get('fresh') === '1' }));
       } else {
         sendJson(res, 404, { error: 'not found' });
       }
@@ -656,6 +878,60 @@ function cmdServe(portArg) {
   server.listen(port, '127.0.0.1', () => {
     console.log(`claude-usage dashboard: ${cyan(`http://localhost:${port}`)}  (Ctrl-C to stop)`);
   });
+}
+
+async function cmdMachines({ json = false, fresh = false } = {}) {
+  const result = await collectMachines({ fresh });
+  if (json) return console.log(JSON.stringify(result, null, 2));
+  const DIR_W = 22;
+  console.log('');
+  for (const m of result.machines) {
+    const where = m.local ? dim(' (local)') : dim(` (${m.target})`);
+    const age = m.cachedMs ? dim(`  [cached ${fmtAge(m.cachedMs)} ago]`) : '';
+    console.log(bold(m.name) + where + age);
+    if (m.stale) console.log('  ' + yellow(`⚠ refresh failed (${m.stale}) — showing last known data`));
+    if (m.error) { console.log('  ' + yellow(`⚠ ${m.error}`)); console.log(''); continue; }
+    if (!m.dirs.length) { console.log('  ' + dim('no Claude config dirs found')); }
+    for (const d of m.dirs) {
+      const who = d.error
+        ? yellow(`⚠ ${d.error}`)
+        : [d.email, d.org].filter(Boolean).join(' · ') || dim('not logged in');
+      console.log('  ' + cyan(d.configDir.padEnd(DIR_W)) + who);
+    }
+    console.log('');
+  }
+  if (!Object.keys(loadHosts()).length) {
+    console.log(dim('add a remote machine with: claude-usage host add NAME SSH-TARGET'));
+    console.log(dim('e.g.  claude-usage host add ubuntu-srv alek@ubuntu-srv') + '\n');
+  }
+}
+
+function cmdHost(action, name, target) {
+  const hosts = loadHosts();
+  if (!action || action === 'list') {
+    const names = Object.keys(hosts);
+    if (!names.length) return console.log('no remote machines registered');
+    for (const n of names) console.log(bold(n.padEnd(20)) + dim(hosts[n].ssh));
+    return;
+  }
+  if (action === 'add') {
+    if (!name || !target) {
+      throw new Error('usage: claude-usage host add NAME SSH-TARGET  (e.g. host add ubuntu-srv alek@ubuntu-srv)');
+    }
+    hosts[name] = { ssh: target, added_at: new Date().toISOString() };
+    saveHosts(hosts);
+    console.log(green('added') + ` ${name} → ${target}`);
+    console.log(dim('verify with: claude-usage machines'));
+    return;
+  }
+  if (action === 'remove') {
+    if (!name || !hosts[name]) throw new Error(`no such host: ${name || '(none given)'}`);
+    delete hosts[name];
+    saveHosts(hosts);
+    console.log(green('removed') + ' ' + name);
+    return;
+  }
+  throw new Error(`unknown host action: ${action} (add | remove | list)`);
 }
 
 function demoAccounts() {
@@ -682,6 +958,11 @@ function help() {
   claude-usage remove NAME  forget an account
   claude-usage list         list stored accounts
   claude-usage sessions     running Claude Code sessions + the account each uses
+  claude-usage machines     which account each Claude config dir is logged into,
+                            on this machine and any registered remote host
+  claude-usage host add NAME SSH-TARGET   watch a remote machine over ssh
+  claude-usage host remove NAME           stop watching it
+  claude-usage host list                  list registered machines
   claude-usage serve [port] web dashboard on http://localhost:${DEFAULT_PORT} (localhost only)
   claude-usage --json       raw JSON output
   claude-usage --fresh      bypass the 2-minute result cache
@@ -767,6 +1048,7 @@ const PAGE_HTML = `<!doctype html>
                    background: var(--good); flex: none; }
   td .idle { color: var(--muted); }
   .empty { color: var(--muted); padding: 14px 2px; font-size: 13px; }
+  .approx { color: var(--muted); }
   @media (max-width: 640px) {
     .meter { grid-template-columns: 110px 1fr 42px; }
     .meter .resets { grid-column: 2 / -1; padding-bottom: 4px; }
@@ -782,6 +1064,8 @@ const PAGE_HTML = `<!doctype html>
 <div id="accounts"><div class="empty">Loading…</div></div>
 <h2>Active Claude Code sessions</h2>
 <div id="sessions"><div class="empty">Loading…</div></div>
+<h2>Machines &amp; config dirs</h2>
+<div id="machines"><div class="empty">Loading…</div></div>
 <script>
 const WINDOW_LABELS = ${JSON.stringify(WINDOW_LABELS)};
 const WINDOW_ORDER = ${JSON.stringify(WINDOW_ORDER)};
@@ -918,13 +1202,18 @@ function renderSessions(result) {
     tr.append(el('td', null, s.cwd || '–'));
     const last = el('td', 'num');
     const idleMs = s.lastActiveAt ? Math.max(0, Date.now() - new Date(s.lastActiveAt)) : null;
-    if (idleMs === null) {
+    // "~" marks activity inferred from the whole project directory rather than
+    // this session's own transcript — see preciseActivity in collectSessions
+    const tilde = s.preciseActivity === false && idleMs !== null ? '~' : '';
+    if (s.status === 'busy') {
+      last.append(el('span', 'badge', 'busy'));
+    } else if (idleMs === null) {
       last.append(el('span', 'idle', '–'));
     } else if (idleMs < ${ACTIVE_WINDOW_MS}) {
       last.append(el('span', 'badge', 'active'));
-      last.append(el('span', 'idle', ' · ' + fmtAge(idleMs) + ' ago'));
+      last.append(el('span', 'idle', ' · ' + tilde + fmtAge(idleMs) + ' ago'));
     } else {
-      last.append(el('span', 'idle', fmtAge(idleMs) + ' ago'));
+      last.append(el('span', tilde ? 'idle approx' : 'idle', tilde + fmtAge(idleMs) + ' ago'));
     }
     tr.append(last);
     tr.append(el('td', 'num', s.startedAt ? fmtRel(Date.now() - new Date(s.startedAt)) : ''));
@@ -932,6 +1221,52 @@ function renderSessions(result) {
   }
   table.append(tbody);
   root.append(table);
+}
+
+function renderMachines(result) {
+  const root = document.getElementById('machines');
+  root.replaceChildren();
+  const machines = (result && result.machines) || [];
+  if (!machines.length) { root.append(el('div', 'empty', 'No machines found.')); return; }
+  for (const m of machines) {
+    const card = el('div', 'card');
+    const head = el('div', 'card-head');
+    head.append(el('span', 'label', m.name));
+    head.append(el('span', 'who', m.local ? 'local' : m.target || 'remote'));
+    if (m.cachedMs) head.append(el('span', 'age', 'cached ' + fmtAge(m.cachedMs) + ' ago'));
+    card.append(head);
+    if (m.stale) {
+      const w = el('div', 'warnline');
+      w.append(el('span', 'icon', '⚠ '),
+        document.createTextNode('refresh failed (' + m.stale + ') — showing last known data'));
+      card.append(w);
+    }
+    if (m.error) {
+      const w = el('div', 'warnline');
+      w.append(el('span', 'icon', '⚠ '), document.createTextNode(m.error));
+      card.append(w);
+    } else if (!m.dirs || !m.dirs.length) {
+      card.append(el('div', 'empty', 'no Claude config dirs found'));
+    } else {
+      const table = el('table');
+      const tbody = el('tbody');
+      for (const d of m.dirs) {
+        const tr = el('tr');
+        const c = el('td'); c.append(el('span', 'cfg', d.configDir)); tr.append(c);
+        if (d.error) {
+          const w = el('td');
+          w.append(el('span', 'icon', '⚠ '), document.createTextNode(d.error));
+          tr.append(w);
+        } else {
+          tr.append(el('td', null, [d.email, d.org].filter(Boolean).join(' · ') || 'not logged in'));
+        }
+        tbody.append(tr);
+      }
+      table.append(tbody);
+      card.append(table);
+    }
+    root.append(card);
+  }
 }
 
 const DEMO = new URLSearchParams(location.search).has('demo');
@@ -978,17 +1313,29 @@ async function loadSessions() {
   }
 }
 
+async function loadMachines(fresh) {
+  try {
+    const r = await fetch('/api/machines' + (fresh ? '?fresh=1' : ''));
+    renderMachines(await r.json());
+  } catch (e) {
+    document.getElementById('machines').replaceChildren(
+      el('div', 'empty', 'failed to load machines: ' + e.message));
+  }
+}
+
 document.getElementById('refresh').addEventListener('click', async (ev) => {
   const b = ev.currentTarget;
   b.disabled = true;
-  await Promise.all([loadUsage(true), loadSessions()]);
+  await Promise.all([loadUsage(true), loadSessions(), loadMachines(true)]);
   setTimeout(() => { b.disabled = false; }, 15000); // respect the endpoint's rate limit
 });
 
 loadUsage(false);
 loadSessions();
+loadMachines(false);
 setInterval(() => loadUsage(false), 180000); // ~3 min: the safe polling interval
 setInterval(loadSessions, 15000);
+setInterval(() => loadMachines(false), 60000); // matches HOST_CACHE_TTL_MS
 </script>
 </body>
 </html>`;
@@ -997,7 +1344,8 @@ setInterval(loadSessions, 15000);
 (async () => {
   const argv = process.argv.slice(2);
   const flags = new Set(argv.filter((a) => a.startsWith('-')));
-  const [cmd, arg] = argv.filter((a) => !a.startsWith('-'));
+  const pos = argv.filter((a) => !a.startsWith('-'));
+  const [cmd, arg, arg2, arg3] = pos;
   if (flags.has('--help') || flags.has('-h')) return help();
   if (flags.has('--demo')) return cmdDemo();
   switch (cmd) {
@@ -1007,6 +1355,8 @@ setInterval(loadSessions, 15000);
     case 'remove': return cmdRemove(arg);
     case 'list': return cmdList();
     case 'sessions': return cmdSessions();
+    case 'machines': return cmdMachines({ json: flags.has('--json'), fresh: flags.has('--fresh') });
+    case 'host': return cmdHost(arg, arg2, arg3);
     case 'serve': return cmdServe(arg);
     case 'help': return help();
     default:
