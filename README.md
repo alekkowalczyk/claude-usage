@@ -9,6 +9,7 @@ company-org1  (you@company.com · Org One)  ● active (2m ago)
   Week (all models)   ███████░░░░░░░░░░░░░  34%   resets in 4d 4h (Sun 10:50 PM)
   Week (Fable)        ████████████████░░░░  81%   resets in 4d 4h (Sun 10:50 PM)
   Extra usage (mo)    ██████████░░░░░░░░░░  50%   175.86 USD of 350.00 USD
+  Limit resets        1 of 1 left · use by Thu, Oct 22
 
 company-org2  (you@company.com · Org Two)
   Session (5h)        ░░░░░░░░░░░░░░░░░░░░   0%
@@ -18,6 +19,7 @@ personal-1  [cached 45s ago]  last session 26h ago
   used by: this-laptop ~/.claude-personal
   Session (5h)        ████████████░░░░░░░░  62%   resets in 30m (Wed 07:20 PM)
   Week (all models)   ██████████████████░░  91%   resets in 12h 0m (Thu 06:50 AM)
+  Limit resets        none left (1 used)
 ```
 
 If you juggle several Claude subscriptions (a couple of company orgs, a personal Max plan…), checking how much headroom each one has left means logging in and out or hopping between machines. This tool stores an OAuth token per account and shows all the usage windows — the 5-hour session, the weekly all-models and per-model (Fable, Opus, …) limits, and extra-usage spend — in one place.
@@ -28,6 +30,7 @@ If you juggle several Claude subscriptions (a couple of company orgs, a personal
 
 - **Multiple accounts** — label them however you like (`work-org1`, `personal`, …), each with its own OAuth token that auto-refreshes.
 - **All usage windows** — 5-hour session, weekly (all models and per-model, e.g. Fable), and monthly extra-usage spend, with reset times.
+- **Limit resets** — if the account has been granted usage-limit resets (e.g. the one-off reset that came with a model launch), shows how many are left and the use-by date. When the account is at a limit and a reset can be spent, it says so; run `/limit-reset` in a Claude Code session on that account to use it. The tool only reads this, it never spends a reset.
 - **Web dashboard** — `claude-usage serve` gives you a self-refreshing localhost page with the same data.
 - **Running sessions** (macOS) — `claude-usage sessions` lists every running Claude Code process, which account and config dir it uses, its project directory, and when it was last active — sorted most-recent first, with a **● busy** badge for sessions working right now. Activity comes from each session's own transcript records (via `<config dir>/sessions/<pid>.json`), not file timestamps, so idle sessions are not reported as active when Claude Code rewrites transcripts in bulk. A `~` marks the rare session whose activity could only be inferred from its project directory.
 - **Machines & config dirs** — `claude-usage machines` shows which account each Claude config dir is logged into (`~/.claude`, `~/.claude-work`, `~/.claude-2`, …), on this machine and on any remote host you register. Handy when you run several logins side by side and want to know which one a shell will pick up.

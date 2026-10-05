@@ -33,8 +33,13 @@ const TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 const REDIRECT_URI = 'https://console.anthropic.com/oauth/code/callback';
 const SCOPES = 'org:create_api_key user:profile user:inference';
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+// ?cedar_ember=1 adds the usage-limit reset grants (see resetsOf) to the response
+const USAGE_QUERY = '?cedar_ember=1';
 const BETA_HEADER = 'oauth-2025-04-20';
 const USER_AGENT = 'claude-code/2.0.14'; // mandatory shape — wrong/missing UA ⇒ permanent 429s
+// The usage request identifies as the Claude Code CLI itself: the server derives
+// the reset "surface" from it, and anything else gets ineligible_reason "surface".
+const USAGE_USER_AGENT = 'claude-cli/2.1.289 (external, cli)';
 // -----------------------------------------------------------------------------
 
 const CONFIG_DIR = path.join(os.homedir(), '.config', 'claude-usage');
@@ -221,11 +226,12 @@ async function fetchUsage(label, store) {
     await refreshProfile(label, store);
   }
   const doGet = () =>
-    fetch(USAGE_URL, {
+    fetch(USAGE_URL + USAGE_QUERY, {
       headers: {
         Authorization: `Bearer ${store.profiles[label].access_token}`,
         'anthropic-beta': BETA_HEADER,
-        'User-Agent': USER_AGENT,
+        'User-Agent': USAGE_USER_AGENT,
+        'x-app': 'cli',
         Accept: 'application/json',
       },
       signal: AbortSignal.timeout(15000),
@@ -722,6 +728,46 @@ function windowsOf(data) {
   }));
 }
 
+// Usage-limit resets: grants (e.g. a model-launch promo) that refill the session
+// and weekly limits on demand, spent with /limit-reset in Claude Code. They arrive
+// as `cedar_ember` when the request asks for them. Returns null when the account
+// has no live grant — expired grants and ineligible accounts show nothing.
+function resetsOf(data) {
+  const ce = data && data.cedar_ember;
+  if (!ce || typeof ce !== 'object' || !Array.isArray(ce.grants)) return null;
+  const live = ce.grants.filter((g) => g && typeof g.resets_left === 'number' &&
+    !(g.ends_at && new Date(g.ends_at) < Date.now()));
+  if (!live.length) return null;
+  const open = live.filter((g) => g.resets_left > 0);
+  const deadlines = open.map((g) => g.ends_at).filter(Boolean)
+    .sort((a, b) => new Date(a) - new Date(b));
+  return {
+    left: open.reduce((n, g) => n + g.resets_left, 0),
+    total: live.reduce((n, g) => n + (g.resets_total || 0), 0),
+    deadline: deadlines[0] || null,
+    usableNow: open.some((g) => g.usable_now && !g.paused),
+    paused: open.length > 0 && open.every((g) => g.paused),
+    requiresLimit: open.length > 0 && open.every((g) => g.use_requires_limit),
+    atLimit: !!ce.at_limit,
+  };
+}
+
+// "1 of 1 left · use by Thu, Oct 22" — the status text shared by both renderers,
+// whether a reset can be spent now, and a hint when the account is at a limit
+// (where spending one pays off). Self-contained so the dashboard can embed it.
+function resetSummary(r) {
+  if (!r.left) return { text: `none left (${r.total} used)`, avail: false, hint: '' };
+  const when = r.deadline
+    ? new Date(r.deadline).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })
+    : '';
+  let text = `${r.left} of ${r.total} left` + (when ? ` · use by ${when}` : '');
+  let hint = '';
+  if (r.paused) text += ' · paused';
+  else if (!r.usableNow) text += r.requiresLimit && !r.atLimit ? ' · usable at a limit' : ' · not usable right now';
+  else if (r.atLimit) hint = 'at limit: run /limit-reset in Claude Code';
+  return { text, avail: r.usableNow && !r.paused, hint };
+}
+
 const fmtAge = (ms) => (ms < 120e3 ? Math.round(ms / 1000) + 's' : fmtRel(ms));
 
 // "used by: <machine> <config dir> · …", wrapped to the terminal. Widths are
@@ -801,6 +847,12 @@ function renderAccount({ label, identity, data, cachedMs, stale, lastSessionAt, 
       const why = xu.disabled_reason || (xu.user_disabled ? 'user_disabled' : '');
       console.log(`  ${name} ${dim('off' + (why ? ` (${why})` : ''))}`);
     }
+  }
+  const resets = resetsOf(data);
+  if (resets) {
+    const { text, avail, hint } = resetSummary(resets);
+    const name = 'Limit resets'.padEnd(19);
+    console.log(`  ${name} ${avail ? green(text) : dim(text)}` + (hint ? '   ' + bold(green(hint)) : ''));
   }
   console.log('');
 }
@@ -1029,9 +1081,9 @@ function demoAccounts() {
   const now = Date.now();
   const iso = (h) => new Date(now + h * 3600e3).toISOString();
   return [
-    { label: 'company-org1', identity: 'you@company.com · Org One', cachedMs: 0, lastSessionAt: new Date(now - 90e3).toISOString(), usedBy: [{ machine: 'this-laptop', local: true, configDir: '~/.claude' }, { machine: 'build-box', local: false, configDir: '~/.claude' }], data: { limits: [{ kind: 'session', percent: 8, resets_at: iso(2.3) }, { kind: 'weekly_all', percent: 34, resets_at: iso(100) }, { kind: 'weekly_scoped', percent: 81, resets_at: iso(100), scope: { model: { display_name: 'Fable' } }, is_active: true }], extra_usage: { is_enabled: true, monthly_limit: 35000, used_credits: 17586, utilization: 50.2, currency: 'USD', decimal_places: 2 } } },
+    { label: 'company-org1', identity: 'you@company.com · Org One', cachedMs: 0, lastSessionAt: new Date(now - 90e3).toISOString(), usedBy: [{ machine: 'this-laptop', local: true, configDir: '~/.claude' }, { machine: 'build-box', local: false, configDir: '~/.claude' }], data: { limits: [{ kind: 'session', percent: 8, resets_at: iso(2.3) }, { kind: 'weekly_all', percent: 34, resets_at: iso(100) }, { kind: 'weekly_scoped', percent: 81, resets_at: iso(100), scope: { model: { display_name: 'Fable' } }, is_active: true }], extra_usage: { is_enabled: true, monthly_limit: 35000, used_credits: 17586, utilization: 50.2, currency: 'USD', decimal_places: 2 }, cedar_ember: { at_limit: false, grants: [{ resets_total: 1, resets_left: 1, ends_at: iso(400), usable_now: true, paused: false, use_requires_limit: false }] } } },
     { label: 'company-org2', identity: 'you@company.com · Org Two', cachedMs: 0, data: { five_hour: { utilization: 0, resets_at: null }, seven_day: { utilization: 3, resets_at: iso(52) } } },
-    { label: 'personal-1', identity: '', cachedMs: 45000, lastSessionAt: new Date(now - 26 * 3600e3).toISOString(), usedBy: [{ machine: 'this-laptop', local: true, configDir: '~/.claude-personal' }], data: { five_hour: { utilization: 62, resets_at: iso(0.5) }, seven_day: { utilization: 91, resets_at: iso(12) } } },
+    { label: 'personal-1', identity: '', cachedMs: 45000, lastSessionAt: new Date(now - 26 * 3600e3).toISOString(), usedBy: [{ machine: 'this-laptop', local: true, configDir: '~/.claude-personal' }], data: { five_hour: { utilization: 62, resets_at: iso(0.5) }, seven_day: { utilization: 91, resets_at: iso(12) }, cedar_ember: { at_limit: false, grants: [{ resets_total: 1, resets_left: 0, ends_at: iso(400), usable_now: false, paused: false, use_requires_limit: false }] } } },
     { label: 'personal-2', identity: '', cachedMs: 0, data: { __error: 'rate-limited by the usage endpoint — try again in a few minutes' } },
   ];
 }
@@ -1123,6 +1175,9 @@ const PAGE_HTML = `<!doctype html>
   .meter .fill { height: 100%; border-radius: 4px; min-width: 2px; }
   .meter .pct { font-variant-numeric: tabular-nums; text-align: right; font-weight: 600; }
   .meter .resets { color: var(--muted); font-size: 12px; }
+  .meter .grant { grid-column: 2 / -1; color: var(--muted); font-size: 13px; }
+  .meter .grant.avail { color: var(--good); font-weight: 600; }
+  .meter .grant .hint { color: var(--ink-2); font-weight: 600; margin-left: 8px; }
   .warnline { color: var(--ink-2); font-size: 13px; }
   .warnline .icon { color: var(--warning); }
   table { width: 100%; border-collapse: collapse; background: var(--surface);
@@ -1164,6 +1219,8 @@ const WINDOW_LABELS = ${JSON.stringify(WINDOW_LABELS)};
 const WINDOW_ORDER = ${JSON.stringify(WINDOW_ORDER)};
 const LIMIT_KIND_LABELS = ${JSON.stringify(LIMIT_KIND_LABELS)};
 ${windowsOf.toString()}
+${resetsOf.toString()}
+${resetSummary.toString()}
 
 const el = (tag, cls, text) => {
   const n = document.createElement(tag);
@@ -1287,6 +1344,16 @@ function renderAccounts(result) {
           const why = xu.disabled_reason || (xu.user_disabled ? 'user_disabled' : '');
           card.append(el('div', 'warnline', 'Extra usage: off' + (why ? ' (' + why + ')' : '')));
         }
+      }
+      const resets = resetsOf(acct.data);
+      if (resets) {
+        const s = resetSummary(resets);
+        const row = el('div', 'meter');
+        row.append(el('span', 'win', 'Limit resets'));
+        const status = el('span', s.avail ? 'grant avail' : 'grant', s.text);
+        if (s.hint) status.append(el('span', 'hint', s.hint));
+        row.append(status);
+        card.append(row);
       }
     }
     root.append(card);
